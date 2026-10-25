@@ -1,17 +1,21 @@
-
 import os
 import time
+import base64
 import threading
-from urllib.parse import quote
 import requests
 from flask import Flask
 
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
 
 BOT_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-IMAGE_URL = "https://image.pollinations.ai/prompt/"
+CF_URL = (
+    f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
+    "/ai/run/@cf/black-forest-labs/flux-1-schnell"
+)
 
 credits = {}
 waiting = set()
@@ -42,17 +46,24 @@ def send_message(chat_id, text, markup=None):
 
 
 def create_image(prompt):
-    response = requests.get(
-        IMAGE_URL + quote(prompt),
-        params={"width": 1024, "height": 1024, "nologo": "true"},
-        timeout=150
+    response = requests.post(
+        CF_URL,
+        headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+        json={"prompt": prompt},
+        timeout=120
     )
-    content_type = response.headers.get("Content-Type", "")
-    if not response.ok or "image" not in content_type:
-        print("Rasm xatosi:", response.status_code,
-              response.text[:300])
+
+    if not response.ok:
+        print("Cloudflare xatosi:", response.status_code,
+              response.text[:500])
         return None
-    return response.content
+
+    data = response.json()
+    image = (data.get("result") or {}).get("image")
+    if not image:
+        print("Javobda rasm topilmadi:", str(data)[:500])
+        return None
+    return base64.b64decode(image)
 
 
 def send_photo(chat_id, image_bytes):
@@ -99,7 +110,8 @@ def handle_message(msg):
             waiting.add(user_id)
             send_message(
                 chat_id,
-                "Rasm qanday bo‘lishini yozing:",
+                "Rasm qanday bo‘lishini yozing "
+                "(inglizcha yozsangiz sifati yaxshiroq):",
                 keyboard
             )
         else:
@@ -118,6 +130,10 @@ def handle_message(msg):
     elif user_id in waiting:
         waiting.discard(user_id)
         send_message(chat_id, "⏳ Rasm yaratilmoqda...")
+
+        if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+            send_message(chat_id, "Cloudflare serverda sozlanmagan.")
+            return
 
         try:
             image = create_image(text)
