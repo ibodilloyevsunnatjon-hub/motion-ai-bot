@@ -1,21 +1,17 @@
 
 import os
 import time
-import base64
 import threading
+from urllib.parse import quote
 import requests
 from flask import Flask
 
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
 BOT_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-IMAGE_URL = (
-    "https://generativelanguage.googleapis.com/v1/"
-    "models/gemini-3.1-flash-image:generateContent"
-)
+IMAGE_URL = "https://image.pollinations.ai/prompt/"
 
 credits = {}
 waiting = set()
@@ -46,37 +42,17 @@ def send_message(chat_id, text, markup=None):
 
 
 def create_image(prompt):
-    response = requests.post(
-        IMAGE_URL,
-        headers={
-            "x-goog-api-key": GOOGLE_API_KEY,
-            "Content-Type": "application/json"
-        },
-        json={
-            "contents": [
-                {"parts": [{"text": prompt}]}
-            ],
-            "generationConfig": {
-                "responseModalities": ["IMAGE"]
-            }
-        },
-        timeout=180
+    response = requests.get(
+        IMAGE_URL + quote(prompt),
+        params={"width": 1024, "height": 1024, "nologo": "true"},
+        timeout=150
     )
-
-    if not response.ok:
-        print("Google API xatosi:", response.status_code,
-              response.text[:500])
+    content_type = response.headers.get("Content-Type", "")
+    if not response.ok or "image" not in content_type:
+        print("Rasm xatosi:", response.status_code,
+              response.text[:300])
         return None
-
-    data = response.json()
-    for candidate in data.get("candidates", []):
-        for part in candidate.get("content", {}).get("parts", []):
-            image = part.get("inlineData") or part.get("inline_data")
-            if image and image.get("data"):
-                return base64.b64decode(image["data"])
-
-    print("Javobda rasm topilmadi:", str(data)[:500])
-    return None
+    return response.content
 
 
 def send_photo(chat_id, image_bytes):
@@ -85,7 +61,7 @@ def send_photo(chat_id, image_bytes):
         data={"chat_id": chat_id},
         files={
             "photo": (
-                "motion_ai.png", image_bytes, "image/png"
+                "motion_ai.jpg", image_bytes, "image/jpeg"
             )
         },
         timeout=60
@@ -143,10 +119,6 @@ def handle_message(msg):
         waiting.discard(user_id)
         send_message(chat_id, "⏳ Rasm yaratilmoqda...")
 
-        if not GOOGLE_API_KEY:
-            send_message(chat_id, "Google API kaliti serverda sozlanmagan.")
-            return
-
         try:
             image = create_image(text)
             if image:
@@ -163,7 +135,7 @@ def handle_message(msg):
             else:
                 send_message(
                     chat_id,
-                    "Rasm yaratilmadi. Server logidagi xatoni tekshiring."
+                    "Rasm yaratilmadi. Birozdan keyin qayta urinib ko‘ring."
                 )
         except Exception as error:
             print("Rasm xatosi:", repr(error))
@@ -208,4 +180,3 @@ if __name__ == "__main__":
     threading.Thread(target=telegram_loop, daemon=True).start()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-
