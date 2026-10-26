@@ -7,17 +7,19 @@ from flask import Flask
 
 app = Flask(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
-CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
+SB_URL = os.environ.get("SB_URL", "").strip().rstrip("/")
+SB_KEY = os.environ.get("SB_KEY", "").strip()
 
 BOT_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 CF_URL = (
     f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
     "/ai/run/@cf/black-forest-labs/flux-1-schnell"
 )
+USERS_URL = f"{SB_URL}/rest/v1/users"
 
-credits = {}
 waiting = set()
 offset = 0
 
@@ -31,8 +33,67 @@ keyboard = {
 }
 
 
+def sb_headers():
+    headers = {"apikey": SB_KEY, "Content-Type": "application/json"}
+    if SB_KEY.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {SB_KEY}"
+    return headers
+
+
+def get_credits(user_id):
+    r = requests.get(
+        USERS_URL,
+        headers=sb_headers(),
+        params={"user_id": f"eq.{user_id}", "select": "credits"},
+        timeout=20
+    )
+    if not r.ok:
+        print("Supabase o'qish xatosi:", r.status_code, r.text[:300])
+        return None
+
+    rows = r.json()
+    if rows:
+        return rows[0]["credits"]
+
+    r = requests.post(
+        USERS_URL,
+        headers={**sb_headers(), "Prefer": "return=representation"},
+        json={"user_id": user_id},
+        timeout=20
+    )
+    if not r.ok:
+        print("Supabase yozish xatosi:", r.status_code, r.text[:300])
+        return None
+
+    data = r.json()
+    return data[0]["credits"] if data else 3
+
+
+def set_credits(user_id, value):
+    r = requests.patch(
+        USERS_URL,
+        headers=sb_headers(),
+        params={"user_id": f"eq.{user_id}"},
+        json={"credits": value},
+        timeout=20
+    )
+    if not r.ok:
+        print("Supabase yangilash xatosi:", r.status_code, r.text[:300])
+        return False
+    return True
+
+
 @app.route("/")
 def home():
+    try:
+        requests.get(
+            USERS_URL,
+            headers=sb_headers(),
+            params={"select": "user_id", "limit": "1"},
+            timeout=10
+        )
+    except Exception:
+        pass
     return "Motion AI server ishlayapti!"
 
 
@@ -87,26 +148,31 @@ def handle_message(msg):
     user_id = msg["from"]["id"]
     text = msg["text"].strip()
 
-    if user_id not in credits:
-        credits[user_id] = 3
+    balance = get_credits(user_id)
+    if balance is None:
+        send_message(
+            chat_id,
+            "Baza bilan ulanishda xatolik. Birozdan keyin urinib ko‘ring."
+        )
+        return
 
     if text == "/start":
         send_message(
             chat_id,
             "🎨 Motion AI ga xush kelibsiz!\n"
-            "Sizda 3 ta sinov krediti bor.",
+            f"Sizda {balance} ta kredit bor.",
             keyboard
         )
 
     elif text == "⭐ Kreditlarim":
         send_message(
             chat_id,
-            f"⭐ Qolgan kredit: {credits[user_id]}",
+            f"⭐ Qolgan kredit: {balance}",
             keyboard
         )
 
     elif text == "🖼️ Rasm yaratish":
-        if credits[user_id] > 0:
+        if balance > 0:
             waiting.add(user_id)
             send_message(
                 chat_id,
@@ -117,7 +183,7 @@ def handle_message(msg):
         else:
             send_message(
                 chat_id,
-                "Sinov kreditlari tugadi. Xarid tizimi hali ulanmagan."
+                "Kreditlaringiz tugadi. Xarid tizimi hali ulanmagan."
             )
 
     elif text == "ℹ️ Yordam":
@@ -129,6 +195,11 @@ def handle_message(msg):
 
     elif user_id in waiting:
         waiting.discard(user_id)
+
+        if balance <= 0:
+            send_message(chat_id, "Kreditlaringiz tugadi.")
+            return
+
         send_message(chat_id, "⏳ Rasm yaratilmoqda...")
 
         if not CF_ACCOUNT_ID or not CF_API_TOKEN:
@@ -140,10 +211,11 @@ def handle_message(msg):
             if image:
                 result = send_photo(chat_id, image)
                 if result.ok:
-                    credits[user_id] -= 1
+                    new_balance = balance - 1
+                    set_credits(user_id, new_balance)
                     send_message(
                         chat_id,
-                        f"✅ Tayyor! Qolgan kredit: {credits[user_id]}",
+                        f"✅ Tayyor! Qolgan kredit: {new_balance}",
                         keyboard
                     )
                 else:
@@ -167,6 +239,9 @@ def telegram_loop():
     if not BOT_TOKEN:
         print("BOT_TOKEN sozlanmagan!")
         return
+
+    if not SB_URL or not SB_KEY:
+        print("SB_URL yoki SB_KEY sozlanmagan!")
 
     try:
         requests.get(BOT_URL + "deleteWebhook", timeout=15)
