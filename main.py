@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import base64
 import logging
 import threading
@@ -9,7 +8,7 @@ import requests
 from flask import Flask, jsonify
 
 # =========================
-# LOG VA ASOSIY SOZLAMALAR
+# SOZLAMALAR
 # =========================
 
 logging.basicConfig(
@@ -40,15 +39,19 @@ TELEGRAM_URL = (
     if BOT_TOKEN else ""
 )
 
-if SB_URL and not SB_URL.endswith("/rest/v1"):
-    SB_API = SB_URL + "/rest/v1"
-else:
-    SB_API = SB_URL
+SB_API = (
+    SB_URL
+    if SB_URL.endswith("/rest/v1")
+    else SB_URL + "/rest/v1"
+)
 
-# Foydalanuvchi kutayotgan amal
 USER_STATE = {}
 
-# Kredit paketlari
+
+# =========================
+# KREDIT PAKETLARI
+# =========================
+
 def load_packs():
     result = []
 
@@ -62,7 +65,7 @@ def load_packs():
                 result.append((credits, amount))
 
         except (ValueError, TypeError):
-            log.warning("Noto'g'ri paket sozlamasi: %s", item)
+            log.warning("Noto'g'ri paket: %s", item)
 
     return result or [
         (10, 10000),
@@ -80,7 +83,7 @@ PACKS = load_packs()
 
 def tg_call(method, payload=None, files=None, timeout=40):
     if not BOT_TOKEN:
-        raise RuntimeError("Render'da BOT_TOKEN kiritilmagan")
+        raise RuntimeError("BOT_TOKEN sozlanmagan")
 
     url = f"{TELEGRAM_URL}/{method}"
 
@@ -102,14 +105,13 @@ def tg_call(method, payload=None, files=None, timeout=40):
         data = response.json()
     except ValueError:
         raise RuntimeError(
-            f"Telegram javobi JSON emas: HTTP {response.status_code}"
+            f"Telegram JSON xatosi: HTTP {response.status_code}"
         )
 
     if not response.ok or not data.get("ok"):
         raise RuntimeError(
             f"Telegram {method} xatosi: "
-            f"HTTP {response.status_code}; "
-            f"{str(data)[:500]}"
+            f"HTTP {response.status_code}: {str(data)[:500]}"
         )
 
     return data.get("result")
@@ -128,29 +130,42 @@ def send_message(chat_id, text, reply_markup=None):
 
 
 def send_image_bytes(chat_id, image_bytes, caption=""):
-    payload = {
-        "chat_id": chat_id,
-        "caption": caption
-    }
-
-    files = {
-        "photo": (
-            "motion-ai.jpg",
-            image_bytes,
-            "image/jpeg"
-        )
-    }
-
     return tg_call(
         "sendPhoto",
-        payload,
-        files=files,
-        timeout=60
+        {
+            "chat_id": chat_id,
+            "caption": caption
+        },
+        files={
+            "photo": (
+                "motion-ai.jpg",
+                image_bytes,
+                "image/jpeg"
+            )
+        },
+        timeout=90
+    )
+
+
+def send_video_bytes(chat_id, video_bytes, caption=""):
+    return tg_call(
+        "sendVideo",
+        {
+            "chat_id": chat_id,
+            "caption": caption
+        },
+        files={
+            "video": (
+                "motion-ai.mp4",
+                video_bytes,
+                "video/mp4"
+            )
+        },
+        timeout=180
     )
 
 
 def answer_callback(callback_id):
-    # Telegram tugmasidagi aylanishni to'xtatish
     try:
         tg_call(
             "answerCallbackQuery",
@@ -158,7 +173,7 @@ def answer_callback(callback_id):
             timeout=15
         )
     except Exception:
-        log.exception("Callback javobini yuborib bo'lmadi")
+        log.exception("Callback javob xatosi")
 
 
 # =========================
@@ -173,28 +188,22 @@ def sb_request(
     prefer=None
 ):
     if not SB_URL or not SB_KEY:
-        raise RuntimeError(
-            "Render'da SB_URL yoki SB_KEY kiritilmagan"
-        )
+        raise RuntimeError("SB_URL yoki SB_KEY sozlanmagan")
 
     headers = {
         "apikey": SB_KEY,
         "Content-Type": "application/json"
     }
 
-    # Eski JWT ko'rinishidagi kalitlar uchun.
-    # sb_secret_ kalitini Bearer sifatida yubormaymiz.
     if SB_KEY.startswith("eyJ"):
         headers["Authorization"] = f"Bearer {SB_KEY}"
 
     if prefer:
         headers["Prefer"] = prefer
 
-    url = f"{SB_API}/{path.lstrip('/')}"
-
     response = requests.request(
-        method=method,
-        url=url,
+        method,
+        f"{SB_API}/{path.lstrip('/')}",
         params=params,
         json=body,
         headers=headers,
@@ -233,7 +242,7 @@ def rpc_integer(value):
             value = next(iter(value.values()))
         else:
             raise RuntimeError(
-                f"RPC natijasi kutilgan shaklda emas: {value}"
+                f"RPC natijasi noto'g'ri: {value}"
             )
 
     return int(value)
@@ -242,20 +251,17 @@ def rpc_integer(value):
 def ensure_user(user_id):
     user_id = int(user_id)
 
-    rows = sb_request(
-        "GET",
-        "users",
-        params={
-            "select": "user_id,credits",
-            "user_id": f"eq.{user_id}",
-            "limit": "1"
-        }
-    )
+    params = {
+        "select": "user_id,credits",
+        "user_id": f"eq.{user_id}",
+        "limit": "1"
+    }
+
+    rows = sb_request("GET", "users", params=params)
 
     if rows:
         return rows[0]
 
-    # Yangi foydalanuvchiga 3 ta boshlang'ich kredit
     try:
         sb_request(
             "POST",
@@ -267,29 +273,12 @@ def ensure_user(user_id):
             prefer="return=representation"
         )
     except Exception:
-        # Bir vaqtning o'zida qayta yaratilgan bo'lishi mumkin
-        rows = sb_request(
-            "GET",
-            "users",
-            params={
-                "select": "user_id,credits",
-                "user_id": f"eq.{user_id}",
-                "limit": "1"
-            }
-        )
+        rows = sb_request("GET", "users", params=params)
 
         if not rows:
             raise
 
-    rows = sb_request(
-        "GET",
-        "users",
-        params={
-            "select": "user_id,credits",
-            "user_id": f"eq.{user_id}",
-            "limit": "1"
-        }
-    )
+    rows = sb_request("GET", "users", params=params)
 
     if not rows:
         raise RuntimeError("Foydalanuvchi bazadan topilmadi")
@@ -316,14 +305,12 @@ def create_payment(user_id, credits, amount):
     )
 
     if not isinstance(rows, list) or not rows:
-        raise RuntimeError("To'lov yozuvi bazada yaratilmagan")
+        raise RuntimeError("To'lov bazaga yozilmadi")
 
     payment_id = rows[0].get("id")
 
     if not payment_id:
-        raise RuntimeError(
-            "To'lov yozuvi yaratildi, lekin id qaytmadi"
-        )
+        raise RuntimeError("To'lov ID qaytmadi")
 
     return str(payment_id)
 
@@ -345,7 +332,7 @@ def find_waiting_payment(user_id):
 
 
 # =========================
-# TELEGRAM MENYU
+# MENYU
 # =========================
 
 MAIN_MENU = {
@@ -375,8 +362,7 @@ def show_packs(chat_id):
         buttons.append([
             {
                 "text": (
-                    f"{credits} ta kredit — "
-                    f"{price_text} so'm"
+                    f"{credits} ta kredit — {price_text} so'm"
                 ),
                 "callback_data": f"buy:{credits}"
             }
@@ -385,22 +371,31 @@ def show_packs(chat_id):
     send_message(
         chat_id,
         "Kerakli kredit paketini tanlang:",
-        reply_markup={
-            "inline_keyboard": buttons
-        }
+        reply_markup={"inline_keyboard": buttons}
     )
 
 
 # =========================
-# RASM GENERATSIYASI
+# CLOUDFLARE UMUMIY SOZLAMA
+# =========================
+
+def cloudflare_headers():
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        raise RuntimeError(
+            "CF_ACCOUNT_ID yoki CF_API_TOKEN sozlanmagan"
+        )
+
+    return {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+
+# =========================
+# RASM YARATISH
 # =========================
 
 def create_image(prompt):
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        raise RuntimeError(
-            "CF_ACCOUNT_ID yoki CF_API_TOKEN kiritilmagan"
-        )
-
     endpoint = (
         "https://api.cloudflare.com/client/v4/accounts/"
         f"{CF_ACCOUNT_ID}/ai/run/"
@@ -410,8 +405,7 @@ def create_image(prompt):
     response = requests.post(
         endpoint,
         headers={
-            "Authorization": f"Bearer {CF_API_TOKEN}",
-            "Content-Type": "application/json",
+            **cloudflare_headers(),
             "Accept": "application/json"
         },
         json={
@@ -423,16 +417,13 @@ def create_image(prompt):
 
     if not response.ok:
         raise RuntimeError(
-            f"Cloudflare HTTP {response.status_code}: "
+            f"Cloudflare image HTTP {response.status_code}: "
             f"{response.text[:500]}"
         )
 
-    content_type = response.headers.get(
-        "Content-Type", ""
-    ).lower()
-
-    # API rasmni to'g'ridan-to'g'ri baytlar ko'rinishida qaytarsa
-    if content_type.startswith("image/"):
+    if response.headers.get("Content-Type", "").lower().startswith(
+        "image/"
+    ):
         return response.content
 
     try:
@@ -440,11 +431,11 @@ def create_image(prompt):
     except ValueError:
         if response.content:
             return response.content
-        raise RuntimeError("Cloudflare bo'sh javob qaytardi")
+        raise RuntimeError("Cloudflare rasm javobi bo'sh")
 
     if data.get("success") is False:
         raise RuntimeError(
-            f"Cloudflare xatosi: {str(data.get('errors'))[:400]}"
+            f"Cloudflare rasm xatosi: {str(data.get('errors'))[:400]}"
         )
 
     result = data.get("result", data)
@@ -457,9 +448,7 @@ def create_image(prompt):
         image = None
 
     if not image:
-        raise RuntimeError(
-            "Cloudflare javobida rasm ma'lumoti yo'q"
-        )
+        raise RuntimeError("Javobda rasm ma'lumoti yo'q")
 
     if image.startswith("data:") and "," in image:
         image = image.split(",", 1)[1]
@@ -467,28 +456,14 @@ def create_image(prompt):
     try:
         return base64.b64decode(image)
     except Exception as exc:
-        raise RuntimeError(
-            f"Rasm ma'lumotini ochib bo'lmadi: {exc}"
-        )
+        raise RuntimeError(f"Rasm ma'lumoti ochilmadi: {exc}")
 
 
 def generate_and_send(chat_id, user_id, prompt):
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        send_message(
-            chat_id,
-            "Rasm yaratish sozlanmagan. "
-            "Render'dagi Cloudflare kalitlarini tekshirish kerak."
-        )
-        return
-
     if len(prompt) > 2048:
-        send_message(
-            chat_id,
-            "Prompt juda uzun. 2048 belgidan qisqaroq yozing."
-        )
+        send_message(chat_id, "Prompt 2048 belgidan qisqa bo'lsin.")
         return
 
-    # Avval bitta kreditni atomik tarzda ishlatamiz
     charged = False
 
     try:
@@ -502,8 +477,7 @@ def generate_and_send(chat_id, user_id, prompt):
         if remaining < 0:
             send_message(
                 chat_id,
-                "Kreditingiz qolmagan. "
-                "Kredit sotib olish tugmasidan foydalaning."
+                "Kreditingiz qolmagan. Kredit sotib oling."
             )
             return
 
@@ -516,22 +490,18 @@ def generate_and_send(chat_id, user_id, prompt):
         send_image_bytes(
             chat_id,
             image_bytes,
-            caption="✅ Motion AI orqali yaratildi."
+            "✅ Motion AI orqali yaratildi."
         )
 
         log.info(
-            "Rasm yaratildi: user_id=%s, qolgan_kredit=%s",
+            "Rasm yaratildi: user_id=%s, qolgan=%s",
             user_id,
             remaining
         )
 
     except Exception:
-        log.exception(
-            "Rasm yaratish xatosi: user_id=%s",
-            user_id
-        )
+        log.exception("Rasm yaratish xatosi")
 
-        # Rasm yaratilmasa, ishlatilgan kreditni qaytarishga urinamiz
         if charged:
             try:
                 sb_rpc(
@@ -539,20 +509,182 @@ def generate_and_send(chat_id, user_id, prompt):
                     {"p_user_id": int(user_id)}
                 )
             except Exception:
-                log.exception("Kreditni qaytarish xatosi")
+                log.exception("Rasm krediti qaytmadi")
 
         try:
             send_message(
                 chat_id,
-                "Rasm yaratilmadi. Kreditni qaytarishga urindik. "
-                "Render → Logs sahifasidagi yangi xatoni tekshirish kerak."
+                "❌ Rasm yaratilmadi. Kreditni qaytarishga "
+                "urindik. Render Logs sahifasini tekshiring."
             )
         except Exception:
-            log.exception("Xato xabarini yuborib bo'lmadi")
+            log.exception("Rasm xabari yuborilmadi")
 
 
 # =========================
-# CHEKNI QABUL QILISH
+# VIDEO YARATISH
+# =========================
+
+def create_video(prompt):
+    endpoint = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{CF_ACCOUNT_ID}/ai/run"
+    )
+
+    # Cloudflare Workers AI: P-Video
+    response = requests.post(
+        endpoint,
+        headers=cloudflare_headers(),
+        json={
+            "model": "pruna/p-video",
+            "input": {
+                "prompt": prompt,
+                "duration": 5,
+                "resolution": "720p",
+                "aspect_ratio": "16:9",
+                "fps": 24,
+                "draft": True,
+                "save_audio": True,
+                "prompt_upsampling": True,
+                "disable_safety_filter": False
+            }
+        },
+        timeout=240
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Cloudflare video HTTP {response.status_code}: "
+            f"{response.text[:800]}"
+        )
+
+    content_type = response.headers.get(
+        "Content-Type", ""
+    ).lower()
+
+    if content_type.startswith("video/"):
+        return response.content
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Video API javobi JSON formatida emas"
+        )
+
+    if data.get("success") is False:
+        raise RuntimeError(
+            f"Cloudflare video xatosi: "
+            f"{str(data.get('errors'))[:500]}"
+        )
+
+    state = str(data.get("state", "")).lower()
+
+    if state in ("failed", "error", "cancelled"):
+        raise RuntimeError(
+            f"Video holati: {state}; {str(data)[:500]}"
+        )
+
+    result = data.get("result", data)
+
+    if isinstance(result, dict):
+        video_url = result.get("video") or result.get("url")
+    else:
+        video_url = None
+
+    if not video_url:
+        raise RuntimeError(
+            f"Video manzili topilmadi: {str(data)[:600]}"
+        )
+
+    if not str(video_url).startswith("https://"):
+        raise RuntimeError("Video manzili HTTPS emas")
+
+    video_response = requests.get(
+        video_url,
+        timeout=180
+    )
+
+    if not video_response.ok:
+        raise RuntimeError(
+            f"Videoni yuklab bo'lmadi: HTTP "
+            f"{video_response.status_code}"
+        )
+
+    if not video_response.content:
+        raise RuntimeError("Yuklangan video bo'sh")
+
+    return video_response.content
+
+
+def generate_video_and_send(chat_id, user_id, prompt):
+    if len(prompt) > 2000:
+        send_message(chat_id, "Prompt 2000 belgidan qisqa bo'lsin.")
+        return
+
+    charged = False
+
+    try:
+        result = sb_rpc(
+            "consume_motion_credit",
+            {"p_user_id": int(user_id)}
+        )
+
+        remaining = rpc_integer(result)
+
+        if remaining < 0:
+            send_message(
+                chat_id,
+                "Kreditingiz qolmagan. Kredit sotib oling."
+            )
+            return
+
+        charged = True
+
+        send_message(
+            chat_id,
+            "🎬 Video yaratilmoqda. Bir oz kuting..."
+        )
+
+        video_bytes = create_video(prompt)
+
+        send_video_bytes(
+            chat_id,
+            video_bytes,
+            "✅ Motion AI video yaratdi!"
+        )
+
+        log.info(
+            "Video yaratildi: user_id=%s, qolgan=%s",
+            user_id,
+            remaining
+        )
+
+    except Exception:
+        log.exception("Video yaratish xatosi")
+
+        if charged:
+            try:
+                sb_rpc(
+                    "refund_motion_credit",
+                    {"p_user_id": int(user_id)}
+                )
+            except Exception:
+                log.exception("Video krediti qaytmadi")
+
+        try:
+            send_message(
+                chat_id,
+                "❌ Video yaratilmadi. Kreditni qaytarishga "
+                "urindik. Render → Logs sahifasidagi xatoni "
+                "tekshiring."
+            )
+        except Exception:
+            log.exception("Video xabari yuborilmadi")
+
+
+# =========================
+# CHEK QABUL QILISH
 # =========================
 
 def handle_receipt(message):
@@ -561,16 +693,13 @@ def handle_receipt(message):
     user_id = int(user["id"])
 
     if not ADMIN_ID:
-        send_message(
-            chat_id,
-            "Admin sozlanmagan. To'lovni tekshirib bo'lmaydi."
-        )
+        send_message(chat_id, "Admin sozlanmagan.")
         return
 
     if not message.get("photo"):
         send_message(
             chat_id,
-            "Iltimos, to'lov chekini rasm sifatida yuboring."
+            "To'lov chekini rasm sifatida yuboring."
         )
         return
 
@@ -580,7 +709,7 @@ def handle_receipt(message):
         if not payment:
             send_message(
                 chat_id,
-                "Sizda chek kutayotgan to'lov so'rovi yo'q. "
+                "Chek kutayotgan to'lov topilmadi. "
                 "Avval kredit paketini tanlang."
             )
             return
@@ -604,8 +733,7 @@ def handle_receipt(message):
         if not updated:
             send_message(
                 chat_id,
-                "Chek qabul qilinmadi. "
-                "To'lov holatini qayta tekshiring."
+                "Chek qabul qilinmadi. To'lov holatini tekshiring."
             )
             return
 
@@ -614,27 +742,20 @@ def handle_receipt(message):
                 [
                     {
                         "text": "✅ Tasdiqlash",
-                        "callback_data": (
-                            f"approve:{payment['id']}"
-                        )
+                        "callback_data": f"approve:{payment['id']}"
                     },
                     {
                         "text": "❌ Rad etish",
-                        "callback_data": (
-                            f"reject:{payment['id']}"
-                        )
+                        "callback_data": f"reject:{payment['id']}"
                     }
                 ]
             ]
         }
 
-        name = user.get("first_name", "Noma'lum")
-        username = user.get("username", "username yo'q")
-
         caption = (
             "Yangi to'lov cheki\n"
-            f"Foydalanuvchi: {name}\n"
-            f"Username: @{username}\n"
+            f"Ism: {user.get('first_name', 'Nomaʼlum')}\n"
+            f"Username: @{user.get('username', 'username yoʻq')}\n"
             f"ID: {user_id}\n"
             f"Kredit: {payment['credits']}\n"
             f"Summa: {payment['amount']} so'm\n"
@@ -653,7 +774,6 @@ def handle_receipt(message):
             )
         except Exception:
             log.exception("Admin uchun chek yuborilmadi")
-
             send_message(
                 int(ADMIN_ID),
                 caption,
@@ -662,22 +782,20 @@ def handle_receipt(message):
 
         send_message(
             chat_id,
-            "✅ Chek qabul qilindi. "
-            "Admin to'lovni tekshirganidan keyin kredit beriladi."
+            "✅ Chek qabul qilindi. Admin tekshirganidan keyin "
+            "kredit beriladi."
         )
 
     except Exception:
         log.exception("Chekni qabul qilish xatosi")
-
         send_message(
             chat_id,
-            "Chekni qabul qilishda xatolik yuz berdi. "
-            "Iltimos, keyinroq qayta urinib ko'ring."
+            "Chekni qabul qilishda xatolik yuz berdi."
         )
 
 
 # =========================
-# ADMIN TO'LOVNI BOSHQARISHI
+# ADMIN TO'LOVLARI
 # =========================
 
 def is_admin(user_id):
@@ -688,10 +806,7 @@ def handle_admin_payment(callback, action, payment_id):
     user_id = callback.get("from", {}).get("id")
 
     if not is_admin(user_id):
-        send_message(
-            user_id,
-            "Bu amal faqat admin uchun."
-        )
+        send_message(user_id, "Bu amal faqat admin uchun.")
         return
 
     chat = callback.get("message", {}).get("chat", {})
@@ -722,16 +837,15 @@ def handle_admin_payment(callback, action, payment_id):
 
         send_message(
             buyer_id,
-            f"✅ To'lov tasdiqlandi!\n"
+            "✅ To'lov tasdiqlandi!\n"
             f"Qo'shilgan kredit: {credits}\n"
             f"Jami balans: {balance}"
         )
 
         send_message(
             admin_chat_id,
-            f"✅ To'lov tasdiqlandi. "
-            f"Foydalanuvchi: {buyer_id}; "
-            f"qo'shilgan kredit: {credits}."
+            f"✅ To'lov tasdiqlandi. ID: {buyer_id}; "
+            f"kredit: {credits}."
         )
 
     elif action == "reject":
@@ -749,7 +863,7 @@ def handle_admin_payment(callback, action, payment_id):
         if not updated:
             send_message(
                 admin_chat_id,
-                "Bu to'lov topilmadi yoki oldin ko'rib chiqilgan."
+                "To'lov topilmadi yoki avval ko'rib chiqilgan."
             )
             return
 
@@ -757,8 +871,7 @@ def handle_admin_payment(callback, action, payment_id):
 
         send_message(
             buyer_id,
-            "❌ To'lov tasdiqlanmadi. "
-            "Admin bilan bog'lanib, chekni tekshiring."
+            "❌ To'lov tasdiqlanmadi. Admin bilan bog'laning."
         )
 
         send_message(admin_chat_id, "To'lov rad etildi.")
@@ -777,31 +890,22 @@ def process_callback(callback):
     chat = callback.get("message", {}).get("chat", {})
     chat_id = chat.get("id", user_id)
 
-    # Har qanday callback'da avval aylanishni to'xtatish
     if callback_id:
         answer_callback(callback_id)
-
-    log.info(
-        "Tugma bosildi: user_id=%s, data=%s",
-        user_id,
-        callback_data
-    )
 
     try:
         if callback_data.startswith("buy:"):
             credits = int(callback_data.split(":", 1)[1])
-
             price_map = dict(PACKS)
 
             if credits not in price_map:
-                send_message(chat_id, "Bunday paket topilmadi.")
+                send_message(chat_id, "Paket topilmadi.")
                 return
 
             if not ADMIN_CARD or not CARD_OWNER:
                 send_message(
                     chat_id,
-                    "Karta sozlamasi to'liq emas. "
-                    "Admin kartasi va egasini Render'da kiriting."
+                    "Admin kartasi yoki karta egasi sozlanmagan."
                 )
                 return
 
@@ -811,52 +915,46 @@ def process_callback(callback):
                 price_map[credits]
             )
 
-            price_text = (
-                f"{price_map[credits]:,}".replace(",", " ")
-            )
+            price_text = f"{price_map[credits]:,}".replace(",", " ")
 
             send_message(
                 chat_id,
-                f"💳 To'lov so'rovi yaratildi.\n\n"
+                "💳 To'lov so'rovi yaratildi.\n\n"
                 f"Paket: {credits} ta kredit\n"
                 f"Summa: {price_text} so'm\n"
                 f"Karta: {ADMIN_CARD}\n"
                 f"Karta egasi: {CARD_OWNER}\n\n"
-                f"Pul o'tkazganingizdan keyin chekni "
-                f"rasm ko'rinishida shu chatga yuboring.\n\n"
-                f"So'rov ID: {payment_id}\n"
-                f"Holat: chek kutilmoqda."
+                "Pul o'tkazgach, chekni rasm sifatida yuboring.\n"
+                f"So'rov ID: {payment_id}"
             )
             return
 
         if callback_data.startswith("approve:"):
-            payment_id = callback_data.split(":", 1)[1]
             handle_admin_payment(
-                callback, "approve", payment_id
+                callback,
+                "approve",
+                callback_data.split(":", 1)[1]
             )
             return
 
         if callback_data.startswith("reject:"):
-            payment_id = callback_data.split(":", 1)[1]
             handle_admin_payment(
-                callback, "reject", payment_id
+                callback,
+                "reject",
+                callback_data.split(":", 1)[1]
             )
             return
 
     except Exception:
-        log.exception(
-            "Tugmani bajarish xatosi: %s",
-            callback_data
-        )
+        log.exception("Tugma bajarilmadi: %s", callback_data)
 
         try:
             send_message(
                 chat_id,
-                "Amal bajarilmadi. Render'dagi "
-                "Application Logs sahifasini tekshirish kerak."
+                "Amal bajarilmadi. Render Application Logs'ni tekshiring."
             )
         except Exception:
-            log.exception("Xato haqida xabar yuborilmadi")
+            log.exception("Xato xabari yuborilmadi")
 
 
 def process_message(message):
@@ -873,7 +971,6 @@ def process_message(message):
     user_id = int(user_id)
     text = message.get("text", "")
 
-    # Chek rasmlari
     if message.get("photo"):
         handle_receipt(message)
         return
@@ -881,7 +978,7 @@ def process_message(message):
     if message.get("document"):
         send_message(
             chat_id,
-            "Chekni fayl emas, rasm sifatida yuboring."
+            "Chekni hujjat emas, rasm sifatida yuboring."
         )
         return
 
@@ -889,6 +986,8 @@ def process_message(message):
         return
 
     if text == "/start" or text.startswith("/start "):
+        USER_STATE.pop(user_id, None)
+
         try:
             ensure_user(user_id)
             welcome = (
@@ -896,10 +995,10 @@ def process_message(message):
                 "Kerakli bo'limni tanlang."
             )
         except Exception:
-            log.exception("Foydalanuvchini yaratish xatosi")
+            log.exception("Foydalanuvchi bazasi xatosi")
             welcome = (
-                "Motion AI ishga tushdi, ammo bazaga "
-                "ulanishda xatolik bor. Admin loglarni tekshirishi kerak."
+                "Bazaga ulanishda xatolik yuz berdi. "
+                "Admin loglarni tekshirishi kerak."
             )
 
         send_message(
@@ -911,20 +1010,22 @@ def process_message(message):
 
     if text == "🖼️ Rasm yaratish":
         USER_STATE[user_id] = "image_prompt"
-
         send_message(
             chat_id,
-            "Rasm uchun prompt yozing.\n"
-            "Masalan: quyosh botayotgan paytda tog'lar "
-            "orasida turgan kichik uy, realistik uslub."
+            "🖼️ Rasm uchun prompt yuboring.\n"
+            "Bekor qilish uchun /cancel yozing."
         )
         return
 
     if text == "🎬 Video yaratish":
+        USER_STATE[user_id] = "video_prompt"
         send_message(
             chat_id,
-            "🎬 Video yaratish xizmati hali ulanmagan. "
-            "Buning uchun alohida video generatsiya API'si kerak."
+            "🎬 Video uchun prompt yuboring.\n\n"
+            "Masalan: A small kitten running through a meadow, "
+            "butterflies flying, cinematic camera movement.\n\n"
+            "Davomiyligi: 5 soniya; sifat: 720p draft.\n"
+            "Bekor qilish uchun /cancel yozing."
         )
         return
 
@@ -932,39 +1033,40 @@ def process_message(message):
         try:
             show_packs(chat_id)
         except Exception:
-            log.exception("Kredit paketlarini ko'rsatish xatosi")
-            send_message(
-                chat_id,
-                "Paketlarni ko'rsatib bo'lmadi. "
-                "Render loglarini tekshirish kerak."
-            )
+            log.exception("Kredit paketlari xatosi")
+            send_message(chat_id, "Paketlarni ko'rsatib bo'lmadi.")
         return
 
     if text == "💰 Balans" or text == "/balance":
         try:
-            balance = get_balance(user_id)
             send_message(
                 chat_id,
-                f"💰 Joriy balans: {balance} ta kredit"
+                f"💰 Joriy balans: {get_balance(user_id)} ta kredit"
             )
         except Exception:
-            log.exception("Balansni o'qish xatosi")
-            send_message(
-                chat_id,
-                "Balansni tekshirib bo'lmadi. "
-                "Baza sozlamalarini tekshirish kerak."
-            )
+            log.exception("Balans xatosi")
+            send_message(chat_id, "Balansni tekshirib bo'lmadi.")
         return
 
     if text == "ℹ️ Yordam":
         send_message(
             chat_id,
-            "Yordam:\n\n"
-            "🖼️ Rasm yaratish — prompt yuboring.\n"
-            "💳 Kredit sotib olish — paket tanlang va "
-            "to'lov chekini yuboring.\n"
-            "💰 Balans — qolgan kreditlar.\n\n"
-            "To'lov cheki admin tomonidan qo'lda tekshiriladi."
+            "ℹ️ Motion AI yordam\n\n"
+            "🖼️ Rasm yaratish — rasm promptini yuboring.\n"
+            "🎬 Video yaratish — video promptini yuboring.\n"
+            "💳 Kredit sotib olish — paketni tanlang.\n"
+            "💰 Balans — qolgan kreditlarni ko'ring.\n"
+            "/cancel — joriy amalni bekor qilish.\n\n"
+            "To'lovlar admin tomonidan tekshiriladi."
+        )
+        return
+
+    if text == "/cancel":
+        USER_STATE.pop(user_id, None)
+        send_message(
+            chat_id,
+            "Amal bekor qilindi.",
+            reply_markup=MAIN_MENU
         )
         return
 
@@ -973,9 +1075,14 @@ def process_message(message):
         generate_and_send(chat_id, user_id, text)
         return
 
+    if USER_STATE.get(user_id) == "video_prompt":
+        USER_STATE.pop(user_id, None)
+        generate_video_and_send(chat_id, user_id, text)
+        return
+
     send_message(
         chat_id,
-        "Iltimos, menyudagi tugmalardan birini tanlang.",
+        "Menyudagi tugmalardan birini tanlang.",
         reply_markup=MAIN_MENU
     )
 
@@ -983,13 +1090,12 @@ def process_message(message):
 def process_update(update):
     if "message" in update:
         process_message(update["message"])
-
     elif "callback_query" in update:
         process_callback(update["callback_query"])
 
 
 # =========================
-# TELEGRAM LONG POLLING
+# TELEGRAM POLLING
 # =========================
 
 def polling_loop():
@@ -1001,9 +1107,8 @@ def polling_loop():
             {"drop_pending_updates": False},
             timeout=20
         )
-        log.info("Webhook holati tekshirildi")
     except Exception:
-        log.exception("Webhookni tekshirishda xatolik")
+        log.exception("Webhook tekshiruvi xatosi")
 
     offset = None
 
@@ -1037,27 +1142,6 @@ def polling_loop():
                         update.get("update_id")
                     )
 
-                    # Xabarni jim qoldirmaslikka harakat qilamiz
-                    try:
-                        if "message" in update:
-                            cid = update["message"]["chat"]["id"]
-                        else:
-                            cid = (
-                                update["callback_query"]
-                                .get("message", {})
-                                .get("chat", {})
-                                .get("id")
-                            )
-
-                        if cid:
-                            send_message(
-                                cid,
-                                "Xatolik yuz berdi. "
-                                "Admin Render loglarini tekshirishi kerak."
-                            )
-                    except Exception:
-                        log.exception("Xato xabarini yuborib bo'lmadi")
-
         except Exception:
             log.exception("Telegram polling xatosi")
             time.sleep(3)
@@ -1080,7 +1164,10 @@ def health():
     return jsonify({"status": "ok"})
 
 
-# Render uchun bitta ishchi jarayon ishlatiladi
+# =========================
+# ISHGA TUSHIRISH
+# =========================
+
 if BOT_TOKEN:
     thread = threading.Thread(
         target=polling_loop,
@@ -1089,7 +1176,7 @@ if BOT_TOKEN:
     )
     thread.start()
 else:
-    log.error("BOT_TOKEN yo'q. Telegram bot ishga tushmaydi.")
+    log.error("BOT_TOKEN sozlanmagan")
 
 
 if __name__ == "__main__":
