@@ -4,6 +4,9 @@ import base64
 import logging
 import threading
 import requests
+import shutil
+import subprocess
+import tempfile
 
 from flask import Flask, jsonify
 
@@ -33,6 +36,20 @@ PACK_PRICES = os.getenv(
     "PACK_PRICES",
     "10:10000,30:25000,100:70000"
 )
+
+# Matnni inglizcha promptga aylantiradigan model
+PROMPT_MODEL = "@cf/meta/llama-3.2-3b-instruct"
+
+# Video sozlamalari
+VIDEO_MODEL = "pruna/p-video"
+VIDEO_DURATION = 5
+VIDEO_RESOLUTION = "720p"
+VIDEO_FPS = 24
+VIDEO_DRAFT = False
+
+# Fayl hajmi cheklovlari
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_VIDEO_BYTES = 20 * 1024 * 1024
 
 TELEGRAM_URL = (
     f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -177,6 +194,52 @@ def answer_callback(callback_id):
 
 
 # =========================
+# TELEGRAM FAYL YUKLASH
+# =========================
+
+def get_telegram_file_bytes(file_id, max_size=None):
+    file_info = tg_call(
+        "getFile",
+        {"file_id": file_id},
+        timeout=30
+    )
+
+    if not file_info or not file_info.get("file_path"):
+        raise RuntimeError(
+            "Telegram fayl manzilini bermadi"
+        )
+
+    file_size = file_info.get("file_size", 0)
+
+    if max_size and file_size and file_size > max_size:
+        raise RuntimeError(
+            "Fayl hajmi ruxsat etilgan chegaradan katta."
+        )
+
+    file_url = (
+        f"https://api.telegram.org/file/bot"
+        f"{BOT_TOKEN}/{file_info['file_path']}"
+    )
+
+    response = requests.get(
+        file_url,
+        timeout=90
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Fayl yuklanmadi: HTTP {response.status_code}"
+        )
+
+    if max_size and len(response.content) > max_size:
+        raise RuntimeError(
+            "Yuklangan fayl hajmi juda katta."
+        )
+
+    return response.content
+
+
+# =========================
 # SUPABASE API
 # =========================
 
@@ -188,7 +251,9 @@ def sb_request(
     prefer=None
 ):
     if not SB_URL or not SB_KEY:
-        raise RuntimeError("SB_URL yoki SB_KEY sozlanmagan")
+        raise RuntimeError(
+            "SB_URL yoki SB_KEY sozlanmagan"
+        )
 
     headers = {
         "apikey": SB_KEY,
@@ -257,7 +322,11 @@ def ensure_user(user_id):
         "limit": "1"
     }
 
-    rows = sb_request("GET", "users", params=params)
+    rows = sb_request(
+        "GET",
+        "users",
+        params=params
+    )
 
     if rows:
         return rows[0]
@@ -272,16 +341,27 @@ def ensure_user(user_id):
             },
             prefer="return=representation"
         )
+
     except Exception:
-        rows = sb_request("GET", "users", params=params)
+        rows = sb_request(
+            "GET",
+            "users",
+            params=params
+        )
 
         if not rows:
             raise
 
-    rows = sb_request("GET", "users", params=params)
+    rows = sb_request(
+        "GET",
+        "users",
+        params=params
+    )
 
     if not rows:
-        raise RuntimeError("Foydalanuvchi bazadan topilmadi")
+        raise RuntimeError(
+            "Foydalanuvchi bazadan topilmadi"
+        )
 
     return rows[0]
 
@@ -289,6 +369,27 @@ def ensure_user(user_id):
 def get_balance(user_id):
     user = ensure_user(user_id)
     return int(user.get("credits") or 0)
+
+
+def consume_credit(user_id):
+    result = sb_rpc(
+        "consume_motion_credit",
+        {"p_user_id": int(user_id)}
+    )
+
+    remaining = rpc_integer(result)
+
+    if remaining < 0:
+        return None
+
+    return remaining
+
+
+def refund_credit(user_id):
+    return sb_rpc(
+        "refund_motion_credit",
+        {"p_user_id": int(user_id)}
+    )
 
 
 def create_payment(user_id, credits, amount):
@@ -305,12 +406,16 @@ def create_payment(user_id, credits, amount):
     )
 
     if not isinstance(rows, list) or not rows:
-        raise RuntimeError("To'lov bazaga yozilmadi")
+        raise RuntimeError(
+            "To'lov bazaga yozilmadi"
+        )
 
     payment_id = rows[0].get("id")
 
     if not payment_id:
-        raise RuntimeError("To'lov ID qaytmadi")
+        raise RuntimeError(
+            "To'lov ID qaytmadi"
+        )
 
     return str(payment_id)
 
@@ -320,7 +425,9 @@ def find_waiting_payment(user_id):
         "GET",
         "payments",
         params={
-            "select": "id,user_id,credits,amount,status,created_at",
+            "select": (
+                "id,user_id,credits,amount,status,created_at"
+            ),
             "user_id": f"eq.{int(user_id)}",
             "status": "eq.waiting",
             "order": "created_at.desc",
@@ -339,7 +446,11 @@ MAIN_MENU = {
     "keyboard": [
         [
             {"text": "🖼️ Rasm yaratish"},
-            {"text": "🎬 Video yaratish"}
+            {"text": "🎬 Matndan video"}
+        ],
+        [
+            {"text": "📸 Rasmdan video"},
+            {"text": "🎞️ Videodan rasm"}
         ],
         [
             {"text": "💳 Kredit sotib olish"},
@@ -362,7 +473,8 @@ def show_packs(chat_id):
         buttons.append([
             {
                 "text": (
-                    f"{credits} ta kredit — {price_text} so'm"
+                    f"{credits} ta kredit — "
+                    f"{price_text} so'm"
                 ),
                 "callback_data": f"buy:{credits}"
             }
@@ -371,12 +483,14 @@ def show_packs(chat_id):
     send_message(
         chat_id,
         "Kerakli kredit paketini tanlang:",
-        reply_markup={"inline_keyboard": buttons}
+        reply_markup={
+            "inline_keyboard": buttons
+        }
     )
 
 
 # =========================
-# CLOUDFLARE UMUMIY SOZLAMA
+# CLOUDFLARE UMUMIY
 # =========================
 
 def cloudflare_headers():
@@ -391,14 +505,128 @@ def cloudflare_headers():
     }
 
 
+def cloudflare_endpoint(model):
+    return (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{CF_ACCOUNT_ID}/ai/run/{model}"
+    )
+
+
+# =========================
+# AVTOMATIK INGLIZCHA PROMPT
+# =========================
+
+def make_english_prompt(user_text, media_type):
+    """
+    Foydalanuvchi o'zbekcha yozadi.
+    AI uni ichkarida inglizcha promptga aylantiradi.
+    Prompt foydalanuvchiga alohida yuborilmaydi.
+    """
+
+    if not user_text or not user_text.strip():
+        raise RuntimeError(
+            "Prompt matni bo'sh."
+        )
+
+    endpoint = cloudflare_endpoint(
+        PROMPT_MODEL
+    )
+
+    if media_type == "image":
+        task_description = (
+            "Create a detailed English prompt for an AI image. "
+            "Describe the scene, subjects, composition, lighting, "
+            "colors, atmosphere and visual style."
+        )
+    else:
+        task_description = (
+            "Create a detailed English prompt for an AI video. "
+            "Describe the scene, subject actions, movement, "
+            "camera motion, lighting and atmosphere. "
+            "Make the actions suitable for a five-second video."
+        )
+
+    response = requests.post(
+        endpoint,
+        headers=cloudflare_headers(),
+        json={
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional AI prompt writer. "
+                        "The user may write in Uzbek or another language. "
+                        "Understand the user's exact idea and convert it "
+                        "into a clear, natural, detailed English prompt. "
+                        "Do not change the meaning. Do not add unrelated "
+                        "people, objects or events. "
+                        + task_description
+                        + " Return only the final English prompt. "
+                        "Do not add explanations, headings or quotation "
+                        "marks."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": user_text
+                }
+            ],
+            "max_tokens": 400,
+            "temperature": 0.4
+        },
+        timeout=120
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Prompt AI HTTP {response.status_code}: "
+            f"{response.text[:600]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Prompt AI javobi JSON formatida emas."
+        )
+
+    if data.get("success") is False:
+        raise RuntimeError(
+            "Prompt AI xatosi: "
+            + str(data.get("errors"))[:400]
+        )
+
+    result = data.get("result", data)
+
+    if isinstance(result, dict):
+        english_prompt = result.get("response")
+    else:
+        english_prompt = None
+
+    if not english_prompt:
+        raise RuntimeError(
+            "AI inglizcha prompt qaytarmadi."
+        )
+
+    english_prompt = str(english_prompt).strip()
+
+    # Model tasodifan qo'shtirnoq bilan javob bersa
+    english_prompt = english_prompt.strip('"').strip("'")
+
+    if not english_prompt:
+        raise RuntimeError(
+            "Inglizcha prompt bo'sh."
+        )
+
+    return english_prompt
+
+
 # =========================
 # RASM YARATISH
 # =========================
 
 def create_image(prompt):
-    endpoint = (
-        "https://api.cloudflare.com/client/v4/accounts/"
-        f"{CF_ACCOUNT_ID}/ai/run/"
+    endpoint = cloudflare_endpoint(
         "@cf/black-forest-labs/flux-1-schnell"
     )
 
@@ -421,9 +649,12 @@ def create_image(prompt):
             f"{response.text[:500]}"
         )
 
-    if response.headers.get("Content-Type", "").lower().startswith(
-        "image/"
-    ):
+    content_type = response.headers.get(
+        "Content-Type",
+        ""
+    ).lower()
+
+    if content_type.startswith("image/"):
         return response.content
 
     try:
@@ -431,11 +662,15 @@ def create_image(prompt):
     except ValueError:
         if response.content:
             return response.content
-        raise RuntimeError("Cloudflare rasm javobi bo'sh")
+
+        raise RuntimeError(
+            "Cloudflare rasm javobi bo'sh"
+        )
 
     if data.get("success") is False:
         raise RuntimeError(
-            f"Cloudflare rasm xatosi: {str(data.get('errors'))[:400]}"
+            "Cloudflare rasm xatosi: "
+            + str(data.get("errors"))[:400]
         )
 
     result = data.get("result", data)
@@ -448,7 +683,9 @@ def create_image(prompt):
         image = None
 
     if not image:
-        raise RuntimeError("Javobda rasm ma'lumoti yo'q")
+        raise RuntimeError(
+            "Javobda rasm ma'lumoti yo'q"
+        )
 
     if image.startswith("data:") and "," in image:
         image = image.split(",", 1)[1]
@@ -456,25 +693,25 @@ def create_image(prompt):
     try:
         return base64.b64decode(image)
     except Exception as exc:
-        raise RuntimeError(f"Rasm ma'lumoti ochilmadi: {exc}")
+        raise RuntimeError(
+            f"Rasm ma'lumoti ochilmadi: {exc}"
+        )
 
 
-def generate_and_send(chat_id, user_id, prompt):
-    if len(prompt) > 2048:
-        send_message(chat_id, "Prompt 2048 belgidan qisqa bo'lsin.")
+def generate_and_send(chat_id, user_id, user_text):
+    if len(user_text) > 2048:
+        send_message(
+            chat_id,
+            "Matn 2048 belgidan qisqa bo'lsin."
+        )
         return
 
     charged = False
 
     try:
-        result = sb_rpc(
-            "consume_motion_credit",
-            {"p_user_id": int(user_id)}
-        )
+        remaining = consume_credit(user_id)
 
-        remaining = rpc_integer(result)
-
-        if remaining < 0:
+        if remaining is None:
             send_message(
                 chat_id,
                 "Kreditingiz qolmagan. Kredit sotib oling."
@@ -483,9 +720,25 @@ def generate_and_send(chat_id, user_id, prompt):
 
         charged = True
 
-        send_message(chat_id, "⏳ Rasm yaratilmoqda. Kuting...")
+        send_message(
+            chat_id,
+            "⏳ Matningiz tayyorlanmoqda..."
+        )
 
-        image_bytes = create_image(prompt)
+        # O'zbekcha matn ichkarida inglizchaga aylantiriladi.
+        english_prompt = make_english_prompt(
+            user_text,
+            "image"
+        )
+
+        send_message(
+            chat_id,
+            "🖼️ Rasm yaratilmoqda..."
+        )
+
+        image_bytes = create_image(
+            english_prompt
+        )
 
         send_image_bytes(
             chat_id,
@@ -500,56 +753,59 @@ def generate_and_send(chat_id, user_id, prompt):
         )
 
     except Exception:
-        log.exception("Rasm yaratish xatosi")
+        log.exception(
+            "Rasm yaratish xatosi"
+        )
 
         if charged:
             try:
-                sb_rpc(
-                    "refund_motion_credit",
-                    {"p_user_id": int(user_id)}
-                )
+                refund_credit(user_id)
             except Exception:
-                log.exception("Rasm krediti qaytmadi")
+                log.exception(
+                    "Rasm krediti qaytmadi"
+                )
 
-        try:
-            send_message(
-                chat_id,
-                "❌ Rasm yaratilmadi. Kreditni qaytarishga "
-                "urindik. Render Logs sahifasini tekshiring."
-            )
-        except Exception:
-            log.exception("Rasm xabari yuborilmadi")
+        send_message(
+            chat_id,
+            "❌ Rasm yaratilmadi. Kreditni qaytarishga "
+            "urindik. Render Logs sahifasini tekshiring."
+        )
 
 
 # =========================
 # VIDEO YARATISH
 # =========================
 
-def create_video(prompt):
+def create_video(prompt, image_data_uri=None):
     endpoint = (
         "https://api.cloudflare.com/client/v4/accounts/"
         f"{CF_ACCOUNT_ID}/ai/run"
     )
 
-    # Cloudflare Workers AI: P-Video
+    video_input = {
+        "prompt": prompt,
+        "duration": VIDEO_DURATION,
+        "resolution": VIDEO_RESOLUTION,
+        "aspect_ratio": "16:9",
+        "fps": VIDEO_FPS,
+        "draft": VIDEO_DRAFT,
+        "save_audio": True,
+        "prompt_upsampling": True,
+        "disable_safety_filter": False
+    }
+
+    # Rasmdan video yaratish uchun
+    if image_data_uri:
+        video_input["image"] = image_data_uri
+
     response = requests.post(
         endpoint,
         headers=cloudflare_headers(),
         json={
-            "model": "pruna/p-video",
-            "input": {
-                "prompt": prompt,
-                "duration": 5,
-                "resolution": "720p",
-                "aspect_ratio": "16:9",
-                "fps": 24,
-                "draft": True,
-                "save_audio": True,
-                "prompt_upsampling": True,
-                "disable_safety_filter": False
-            }
+            "model": VIDEO_MODEL,
+            "input": video_input
         },
-        timeout=240
+        timeout=300
     )
 
     if not response.ok:
@@ -559,7 +815,8 @@ def create_video(prompt):
         )
 
     content_type = response.headers.get(
-        "Content-Type", ""
+        "Content-Type",
+        ""
     ).lower()
 
     if content_type.startswith("video/"):
@@ -574,13 +831,19 @@ def create_video(prompt):
 
     if data.get("success") is False:
         raise RuntimeError(
-            f"Cloudflare video xatosi: "
-            f"{str(data.get('errors'))[:500]}"
+            "Cloudflare video xatosi: "
+            + str(data.get("errors"))[:500]
         )
 
-    state = str(data.get("state", "")).lower()
+    state = str(
+        data.get("state", "")
+    ).lower()
 
-    if state in ("failed", "error", "cancelled"):
+    if state in (
+        "failed",
+        "error",
+        "cancelled"
+    ):
         raise RuntimeError(
             f"Video holati: {state}; {str(data)[:500]}"
         )
@@ -588,17 +851,23 @@ def create_video(prompt):
     result = data.get("result", data)
 
     if isinstance(result, dict):
-        video_url = result.get("video") or result.get("url")
+        video_url = (
+            result.get("video")
+            or result.get("url")
+        )
     else:
         video_url = None
 
     if not video_url:
         raise RuntimeError(
-            f"Video manzili topilmadi: {str(data)[:600]}"
+            "Video manzili topilmadi: "
+            + str(data)[:600]
         )
 
     if not str(video_url).startswith("https://"):
-        raise RuntimeError("Video manzili HTTPS emas")
+        raise RuntimeError(
+            "Video manzili HTTPS emas"
+        )
 
     video_response = requests.get(
         video_url,
@@ -607,32 +876,37 @@ def create_video(prompt):
 
     if not video_response.ok:
         raise RuntimeError(
-            f"Videoni yuklab bo'lmadi: HTTP "
+            "Videoni yuklab bo'lmadi: HTTP "
             f"{video_response.status_code}"
         )
 
     if not video_response.content:
-        raise RuntimeError("Yuklangan video bo'sh")
+        raise RuntimeError(
+            "Yuklangan video bo'sh"
+        )
 
     return video_response.content
 
 
-def generate_video_and_send(chat_id, user_id, prompt):
-    if len(prompt) > 2000:
-        send_message(chat_id, "Prompt 2000 belgidan qisqa bo'lsin.")
+def generate_video_and_send(
+    chat_id,
+    user_id,
+    user_text,
+    image_data_uri=None
+):
+    if len(user_text) > 2000:
+        send_message(
+            chat_id,
+            "Matn 2000 belgidan qisqa bo'lsin."
+        )
         return
 
     charged = False
 
     try:
-        result = sb_rpc(
-            "consume_motion_credit",
-            {"p_user_id": int(user_id)}
-        )
+        remaining = consume_credit(user_id)
 
-        remaining = rpc_integer(result)
-
-        if remaining < 0:
+        if remaining is None:
             send_message(
                 chat_id,
                 "Kreditingiz qolmagan. Kredit sotib oling."
@@ -643,15 +917,32 @@ def generate_video_and_send(chat_id, user_id, prompt):
 
         send_message(
             chat_id,
-            "🎬 Video yaratilmoqda. Bir oz kuting..."
+            "⏳ Matningiz tayyorlanmoqda..."
         )
 
-        video_bytes = create_video(prompt)
+        # O'zbekcha matn ichkarida inglizchaga aylantiriladi.
+        english_prompt = make_english_prompt(
+            user_text,
+            "video"
+        )
+
+        send_message(
+            chat_id,
+            "🎬 5 soniyalik HD video yaratilmoqda. "
+            "Biroz kuting..."
+        )
+
+        video_bytes = create_video(
+            english_prompt,
+            image_data_uri=image_data_uri
+        )
 
         send_video_bytes(
             chat_id,
             video_bytes,
-            "✅ Motion AI video yaratdi!"
+            "✅ Motion AI video yaratdi!\n"
+            "Sifat: HD 720p\n"
+            "Davomiyligi: 5 soniya"
         )
 
         log.info(
@@ -661,26 +952,254 @@ def generate_video_and_send(chat_id, user_id, prompt):
         )
 
     except Exception:
-        log.exception("Video yaratish xatosi")
+        log.exception(
+            "Video yaratish xatosi"
+        )
 
         if charged:
             try:
-                sb_rpc(
-                    "refund_motion_credit",
-                    {"p_user_id": int(user_id)}
-                )
+                refund_credit(user_id)
             except Exception:
-                log.exception("Video krediti qaytmadi")
+                log.exception(
+                    "Video krediti qaytmadi"
+                )
 
+        send_message(
+            chat_id,
+            "❌ Video yaratilmadi. Kreditni qaytarishga "
+            "urindik. Render → Logs sahifasidagi xatoni "
+            "tekshiring."
+        )
+
+
+# =========================
+# RASMDAN VIDEO
+# =========================
+
+def handle_image_video_photo(message):
+    chat_id = message["chat"]["id"]
+    user_id = int(message["from"]["id"])
+
+    try:
+        photo = message["photo"][-1]
+
+        photo_bytes = get_telegram_file_bytes(
+            photo["file_id"],
+            max_size=MAX_IMAGE_BYTES
+        )
+
+        image_data_uri = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(
+                photo_bytes
+            ).decode("utf-8")
+        )
+
+        USER_STATE[user_id] = {
+            "mode": "image_video_prompt",
+            "image_data_uri": image_data_uri
+        }
+
+        send_message(
+            chat_id,
+            "✅ Rasm qabul qilindi!\n\n"
+            "Endi shu rasm asosida qanday video "
+            "yaratishni xohlayotganingizni o'zbekcha yozing.\n\n"
+            "Masalan: Kamera sekin yaqinlashadi, "
+            "daraxt barglari shamolda tebranadi.\n\n"
+            "Video: 5 soniya, HD 720p.\n"
+            "/cancel — bekor qilish."
+        )
+
+    except Exception:
+        log.exception(
+            "Rasmni qabul qilish xatosi"
+        )
+
+        send_message(
+            chat_id,
+            "❌ Rasmni yuklab bo'lmadi. "
+            "Boshqa rasm yuborib ko'ring."
+        )
+
+
+# =========================
+# VIDEODAN RASM OLISH
+# =========================
+
+def extract_video_frame(video_bytes):
+    ffmpeg_path = shutil.which("ffmpeg")
+
+    if not ffmpeg_path:
         try:
+            import imageio_ffmpeg
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+
+        except ImportError:
+            raise RuntimeError(
+                "FFmpeg topilmadi. requirements.txt fayliga "
+                "imageio-ffmpeg qo'shing."
+            )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_path = os.path.join(
+            temp_dir,
+            "input.mp4"
+        )
+
+        output_path = os.path.join(
+            temp_dir,
+            "frame.jpg"
+        )
+
+        with open(input_path, "wb") as file:
+            file.write(video_bytes)
+
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-ss", "00:00:01",
+            "-i", input_path,
+            "-frames:v", "1",
+            "-q:v", "2",
+            output_path
+        ]
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=90
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                "FFmpeg xatosi: "
+                + result.stderr[-700:]
+            )
+
+        if not os.path.exists(output_path):
+            raise RuntimeError(
+                "Video ichidan rasm olinmadi."
+            )
+
+        with open(output_path, "rb") as file:
+            image_bytes = file.read()
+
+        if not image_bytes:
+            raise RuntimeError(
+                "Olingan rasm bo'sh."
+            )
+
+        return image_bytes
+
+
+def extract_and_send_frame(
+    chat_id,
+    user_id,
+    video_bytes
+):
+    charged = False
+
+    try:
+        send_message(
+            chat_id,
+            "🎞️ Videodan rasm ajratilmoqda..."
+        )
+
+        image_bytes = extract_video_frame(
+            video_bytes
+        )
+
+        remaining = consume_credit(user_id)
+
+        if remaining is None:
             send_message(
                 chat_id,
-                "❌ Video yaratilmadi. Kreditni qaytarishga "
-                "urindik. Render → Logs sahifasidagi xatoni "
-                "tekshiring."
+                "Kreditingiz qolmagan. Kredit sotib oling."
             )
-        except Exception:
-            log.exception("Video xabari yuborilmadi")
+            return
+
+        charged = True
+
+        send_image_bytes(
+            chat_id,
+            image_bytes,
+            "✅ Videodan rasm olindi!"
+        )
+
+        log.info(
+            "Videodan rasm olindi: user_id=%s, qolgan=%s",
+            user_id,
+            remaining
+        )
+
+    except Exception:
+        log.exception(
+            "Videodan rasm olish xatosi"
+        )
+
+        if charged:
+            try:
+                refund_credit(user_id)
+            except Exception:
+                log.exception(
+                    "Kredit qaytmadi"
+                )
+
+        send_message(
+            chat_id,
+            "❌ Videodan rasm olinmadi. "
+            "Render Logs sahifasidagi xatoni tekshiring."
+        )
+
+
+def handle_video_upload(message):
+    chat_id = message["chat"]["id"]
+    user_id = int(message["from"]["id"])
+
+    video = message.get("video")
+
+    if not video:
+        video = message.get("document", {})
+
+    if not video.get("file_id"):
+        send_message(
+            chat_id,
+            "Video faylini topib bo'lmadi."
+        )
+        return
+
+    file_size = video.get("file_size", 0)
+
+    if file_size and file_size > MAX_VIDEO_BYTES:
+        send_message(
+            chat_id,
+            "Video hajmi 20 MB dan kichik bo'lishi kerak."
+        )
+        return
+
+    try:
+        video_bytes = get_telegram_file_bytes(
+            video["file_id"],
+            max_size=MAX_VIDEO_BYTES
+        )
+
+        extract_and_send_frame(
+            chat_id,
+            user_id,
+            video_bytes
+        )
+
+    except Exception:
+        log.exception(
+            "Video yuklash xatosi"
+        )
+
+        send_message(
+            chat_id,
+            "Videoni qabul qilishda xatolik yuz berdi."
+        )
 
 
 # =========================
@@ -693,7 +1212,10 @@ def handle_receipt(message):
     user_id = int(user["id"])
 
     if not ADMIN_ID:
-        send_message(chat_id, "Admin sozlanmagan.")
+        send_message(
+            chat_id,
+            "Admin sozlanmagan."
+        )
         return
 
     if not message.get("photo"):
@@ -733,7 +1255,8 @@ def handle_receipt(message):
         if not updated:
             send_message(
                 chat_id,
-                "Chek qabul qilinmadi. To'lov holatini tekshiring."
+                "Chek qabul qilinmadi. "
+                "To'lov holatini tekshiring."
             )
             return
 
@@ -742,11 +1265,15 @@ def handle_receipt(message):
                 [
                     {
                         "text": "✅ Tasdiqlash",
-                        "callback_data": f"approve:{payment['id']}"
+                        "callback_data": (
+                            f"approve:{payment['id']}"
+                        )
                     },
                     {
                         "text": "❌ Rad etish",
-                        "callback_data": f"reject:{payment['id']}"
+                        "callback_data": (
+                            f"reject:{payment['id']}"
+                        )
                     }
                 ]
             ]
@@ -772,8 +1299,12 @@ def handle_receipt(message):
                     "reply_markup": keyboard
                 }
             )
+
         except Exception:
-            log.exception("Admin uchun chek yuborilmadi")
+            log.exception(
+                "Admin uchun chek yuborilmadi"
+            )
+
             send_message(
                 int(ADMIN_ID),
                 caption,
@@ -782,12 +1313,15 @@ def handle_receipt(message):
 
         send_message(
             chat_id,
-            "✅ Chek qabul qilindi. Admin tekshirganidan keyin "
-            "kredit beriladi."
+            "✅ Chek qabul qilindi. Admin tekshirganidan "
+            "keyin kredit beriladi."
         )
 
     except Exception:
-        log.exception("Chekni qabul qilish xatosi")
+        log.exception(
+            "Chekni qabul qilish xatosi"
+        )
+
         send_message(
             chat_id,
             "Chekni qabul qilishda xatolik yuz berdi."
@@ -799,28 +1333,52 @@ def handle_receipt(message):
 # =========================
 
 def is_admin(user_id):
-    return bool(ADMIN_ID) and str(user_id) == ADMIN_ID
+    return (
+        bool(ADMIN_ID)
+        and str(user_id) == ADMIN_ID
+    )
 
 
-def handle_admin_payment(callback, action, payment_id):
+def handle_admin_payment(
+    callback,
+    action,
+    payment_id
+):
     user_id = callback.get("from", {}).get("id")
 
     if not is_admin(user_id):
-        send_message(user_id, "Bu amal faqat admin uchun.")
+        send_message(
+            user_id,
+            "Bu amal faqat admin uchun."
+        )
         return
 
-    chat = callback.get("message", {}).get("chat", {})
-    admin_chat_id = chat.get("id", user_id)
+    chat = callback.get(
+        "message", {}
+    ).get("chat", {})
+
+    admin_chat_id = chat.get(
+        "id",
+        user_id
+    )
 
     if action == "approve":
         result = sb_rpc(
             "approve_motion_payment",
-            {"p_payment_id": payment_id}
+            {
+                "p_payment_id": payment_id
+            }
         )
 
-        if not isinstance(result, dict) or not result.get("ok"):
+        if (
+            not isinstance(result, dict)
+            or not result.get("ok")
+        ):
             reason = (
-                result.get("message", "Noma'lum holat")
+                result.get(
+                    "message",
+                    "Noma'lum holat"
+                )
                 if isinstance(result, dict)
                 else str(result)
             )
@@ -856,7 +1414,9 @@ def handle_admin_payment(callback, action, payment_id):
                 "id": f"eq.{payment_id}",
                 "status": "eq.pending"
             },
-            body={"status": "rejected"},
+            body={
+                "status": "rejected"
+            },
             prefer="return=representation"
         )
 
@@ -871,41 +1431,59 @@ def handle_admin_payment(callback, action, payment_id):
 
         send_message(
             buyer_id,
-            "❌ To'lov tasdiqlanmadi. Admin bilan bog'laning."
+            "❌ To'lov tasdiqlanmadi. "
+            "Admin bilan bog'laning."
         )
 
-        send_message(admin_chat_id, "To'lov rad etildi.")
+        send_message(
+            admin_chat_id,
+            "To'lov rad etildi."
+        )
 
 
 # =========================
-# TUGMALAR VA XABARLAR
+# TUGMALAR
 # =========================
 
 def process_callback(callback):
     callback_id = callback.get("id")
     callback_data = callback.get("data", "")
+
     user = callback.get("from", {})
     user_id = user.get("id")
 
-    chat = callback.get("message", {}).get("chat", {})
-    chat_id = chat.get("id", user_id)
+    chat = callback.get(
+        "message", {}
+    ).get("chat", {})
+
+    chat_id = chat.get(
+        "id",
+        user_id
+    )
 
     if callback_id:
         answer_callback(callback_id)
 
     try:
         if callback_data.startswith("buy:"):
-            credits = int(callback_data.split(":", 1)[1])
+            credits = int(
+                callback_data.split(":", 1)[1]
+            )
+
             price_map = dict(PACKS)
 
             if credits not in price_map:
-                send_message(chat_id, "Paket topilmadi.")
+                send_message(
+                    chat_id,
+                    "Paket topilmadi."
+                )
                 return
 
             if not ADMIN_CARD or not CARD_OWNER:
                 send_message(
                     chat_id,
-                    "Admin kartasi yoki karta egasi sozlanmagan."
+                    "Admin kartasi yoki karta egasi "
+                    "sozlanmagan."
                 )
                 return
 
@@ -915,7 +1493,10 @@ def process_callback(callback):
                 price_map[credits]
             )
 
-            price_text = f"{price_map[credits]:,}".replace(",", " ")
+            price_text = (
+                f"{price_map[credits]:,}"
+                .replace(",", " ")
+            )
 
             send_message(
                 chat_id,
@@ -946,16 +1527,26 @@ def process_callback(callback):
             return
 
     except Exception:
-        log.exception("Tugma bajarilmadi: %s", callback_data)
+        log.exception(
+            "Tugma bajarilmadi: %s",
+            callback_data
+        )
 
         try:
             send_message(
                 chat_id,
-                "Amal bajarilmadi. Render Application Logs'ni tekshiring."
+                "Amal bajarilmadi. "
+                "Render Application Logs'ni tekshiring."
             )
         except Exception:
-            log.exception("Xato xabari yuborilmadi")
+            log.exception(
+                "Xato xabari yuborilmadi"
+            )
 
+
+# =========================
+# XABARLARNI QAYTA ISHLASH
+# =========================
 
 def process_message(message):
     if not message or not message.get("chat"):
@@ -970,32 +1561,32 @@ def process_message(message):
 
     user_id = int(user_id)
     text = message.get("text", "")
+    state = USER_STATE.get(user_id)
 
-    if message.get("photo"):
-        handle_receipt(message)
-        return
-
-    if message.get("document"):
-        send_message(
-            chat_id,
-            "Chekni hujjat emas, rasm sifatida yuboring."
-        )
-        return
-
-    if not text:
-        return
-
+    # START
     if text == "/start" or text.startswith("/start "):
         USER_STATE.pop(user_id, None)
 
         try:
             ensure_user(user_id)
+
             welcome = (
-                "🤖 Motion AI botiga xush kelibsiz!\n"
+                "🤖 Motion AI botiga xush kelibsiz!\n\n"
+                "🖼️ Rasm yaratish\n"
+                "🎬 Matndan video yaratish\n"
+                "📸 Rasmdan video yaratish\n"
+                "🎞️ Videodan rasm olish\n\n"
+                "O'zbekcha yozishingiz mumkin. "
+                "Motion AI matningizni ichkarida inglizchaga "
+                "aylantirib, tayyor media yuboradi.\n\n"
                 "Kerakli bo'limni tanlang."
             )
+
         except Exception:
-            log.exception("Foydalanuvchi bazasi xatosi")
+            log.exception(
+                "Foydalanuvchi bazasi xatosi"
+            )
+
             welcome = (
                 "Bazaga ulanishda xatolik yuz berdi. "
                 "Admin loglarni tekshirishi kerak."
@@ -1008,61 +1599,10 @@ def process_message(message):
         )
         return
 
-    if text == "🖼️ Rasm yaratish":
-        USER_STATE[user_id] = "image_prompt"
-        send_message(
-            chat_id,
-            "🖼️ Rasm uchun prompt yuboring.\n"
-            "Bekor qilish uchun /cancel yozing."
-        )
-        return
-
-    if text == "🎬 Video yaratish":
-        USER_STATE[user_id] = "video_prompt"
-        send_message(
-            chat_id,
-            "🎬 Video uchun prompt yuboring.\n\n"
-            "Masalan: A small kitten running through a meadow, "
-            "butterflies flying, cinematic camera movement.\n\n"
-            "Davomiyligi: 5 soniya; sifat: 720p draft.\n"
-            "Bekor qilish uchun /cancel yozing."
-        )
-        return
-
-    if text == "💳 Kredit sotib olish":
-        try:
-            show_packs(chat_id)
-        except Exception:
-            log.exception("Kredit paketlari xatosi")
-            send_message(chat_id, "Paketlarni ko'rsatib bo'lmadi.")
-        return
-
-    if text == "💰 Balans" or text == "/balance":
-        try:
-            send_message(
-                chat_id,
-                f"💰 Joriy balans: {get_balance(user_id)} ta kredit"
-            )
-        except Exception:
-            log.exception("Balans xatosi")
-            send_message(chat_id, "Balansni tekshirib bo'lmadi.")
-        return
-
-    if text == "ℹ️ Yordam":
-        send_message(
-            chat_id,
-            "ℹ️ Motion AI yordam\n\n"
-            "🖼️ Rasm yaratish — rasm promptini yuboring.\n"
-            "🎬 Video yaratish — video promptini yuboring.\n"
-            "💳 Kredit sotib olish — paketni tanlang.\n"
-            "💰 Balans — qolgan kreditlarni ko'ring.\n"
-            "/cancel — joriy amalni bekor qilish.\n\n"
-            "To'lovlar admin tomonidan tekshiriladi."
-        )
-        return
-
+    # CANCEL
     if text == "/cancel":
         USER_STATE.pop(user_id, None)
+
         send_message(
             chat_id,
             "Amal bekor qilindi.",
@@ -1070,14 +1610,222 @@ def process_message(message):
         )
         return
 
-    if USER_STATE.get(user_id) == "image_prompt":
-        USER_STATE.pop(user_id, None)
-        generate_and_send(chat_id, user_id, text)
+    # RASM YARATISH
+    if text == "🖼️ Rasm yaratish":
+        USER_STATE[user_id] = "image_prompt"
+
+        send_message(
+            chat_id,
+            "🖼️ Qanday rasm xohlayotganingizni "
+            "o'zbekcha yozing.\n\n"
+            "Masalan: Quyosh botayotgan paytda "
+            "dengiz bo'yida turgan oq ot.\n\n"
+            "Motion AI matningizni o'zi inglizchaga "
+            "aylantiradi va rasmni yuboradi.\n\n"
+            "/cancel — bekor qilish."
+        )
         return
 
-    if USER_STATE.get(user_id) == "video_prompt":
+    # MATNDAN VIDEO
+    if text == "🎬 Matndan video":
+        USER_STATE[user_id] = "video_prompt"
+
+        send_message(
+            chat_id,
+            "🎬 Qanday video xohlayotganingizni "
+            "o'zbekcha yozing.\n\n"
+            "Masalan: Oq ot qorli tog'da yugursin, "
+            "kamera uni orqasidan kuzatsin.\n\n"
+            "Davomiyligi: 5 soniya.\n"
+            "Sifati: HD 720p.\n\n"
+            "Motion AI matningizni o'zi inglizchaga "
+            "aylantiradi va videoni yuboradi.\n\n"
+            "/cancel — bekor qilish."
+        )
+        return
+
+    # RASMDAN VIDEO
+    if text == "📸 Rasmdan video":
+        USER_STATE[user_id] = "image_video_wait_image"
+
+        send_message(
+            chat_id,
+            "📸 Video yaratish uchun rasm yuboring.\n\n"
+            "Rasm qabul qilingandan keyin qanday "
+            "harakat bo'lishini o'zbekcha yozasiz.\n\n"
+            "Video: 5 soniya, HD 720p.\n"
+            "/cancel — bekor qilish."
+        )
+        return
+
+    # VIDEODAN RASM
+    if text == "🎞️ Videodan rasm":
+        USER_STATE[user_id] = "video_to_image_wait_video"
+
+        send_message(
+            chat_id,
+            "🎞️ Videodan rasm olish uchun MP4 video "
+            "yuboring.\n\n"
+            "Video hajmi 20 MB dan kichik bo'lishi kerak.\n"
+            "Tizim taxminan 1-soniyadagi kadrni oladi.\n\n"
+            "/cancel — bekor qilish."
+        )
+        return
+
+    # KREDIT SOTIB OLISH
+    if text == "💳 Kredit sotib olish":
+        try:
+            show_packs(chat_id)
+
+        except Exception:
+            log.exception(
+                "Kredit paketlari xatosi"
+            )
+
+            send_message(
+                chat_id,
+                "Paketlarni ko'rsatib bo'lmadi."
+            )
+        return
+
+    # BALANS
+    if text == "💰 Balans" or text == "/balance":
+        try:
+            send_message(
+                chat_id,
+                f"💰 Joriy balans: "
+                f"{get_balance(user_id)} ta kredit"
+            )
+
+        except Exception:
+            log.exception(
+                "Balans xatosi"
+            )
+
+            send_message(
+                chat_id,
+                "Balansni tekshirib bo'lmadi."
+            )
+        return
+
+    # YORDAM
+    if text == "ℹ️ Yordam":
+        send_message(
+            chat_id,
+            "ℹ️ Motion AI yordam\n\n"
+            "🖼️ Rasm yaratish — o'zbekcha matn yozing.\n"
+            "🎬 Matndan video — o'zbekcha video tavsifi yozing.\n"
+            "📸 Rasmdan video — rasm yuboring, keyin "
+            "harakatni o'zbekcha yozing.\n"
+            "🎞️ Videodan rasm — video yuboring.\n"
+            "💳 Kredit sotib olish — paketni tanlang.\n"
+            "💰 Balans — qolgan kreditlarni ko'ring.\n\n"
+            "Matnlar avtomatik inglizchaga aylantiriladi. "
+            "Inglizcha prompt sizga ko'rsatilmaydi.\n\n"
+            "Har bir AI yaratish amali 1 kredit sarflaydi.\n"
+            "/cancel — joriy amalni bekor qilish.\n\n"
+            "To'lovlar admin tomonidan tekshiriladi."
+        )
+        return
+
+    # RASM YUBORILDI
+    if message.get("photo"):
+        if state == "image_video_wait_image":
+            handle_image_video_photo(message)
+        else:
+            handle_receipt(message)
+        return
+
+    # VIDEO YUBORILDI
+    if message.get("video"):
+        if state == "video_to_image_wait_video":
+            handle_video_upload(message)
+        else:
+            send_message(
+                chat_id,
+                "Videodan rasm olish uchun avval "
+                "🎞️ Videodan rasm tugmasini bosing."
+            )
+        return
+
+    # VIDEO HUJJAT KO'RINISHIDA YUBORILDI
+    if message.get("document"):
+        document = message.get("document", {})
+        mime_type = document.get("mime_type", "")
+
+        if (
+            state == "video_to_image_wait_video"
+            and mime_type.startswith("video/")
+        ):
+            handle_video_upload(message)
+
+        else:
+            send_message(
+                chat_id,
+                "Bu fayl qo'llab-quvvatlanmaydi. "
+                "Videoni MP4 formatida yuboring."
+            )
+        return
+
+    if not text:
+        return
+
+    # RASM PROMPTI
+    if state == "image_prompt":
         USER_STATE.pop(user_id, None)
-        generate_video_and_send(chat_id, user_id, text)
+
+        generate_and_send(
+            chat_id,
+            user_id,
+            text
+        )
+        return
+
+    # MATNDAN VIDEO PROMPTI
+    if state == "video_prompt":
+        USER_STATE.pop(user_id, None)
+
+        generate_video_and_send(
+            chat_id,
+            user_id,
+            text
+        )
+        return
+
+    # RASMDAN VIDEO PROMPTI
+    if (
+        isinstance(state, dict)
+        and state.get("mode") == "image_video_prompt"
+    ):
+        image_data_uri = state.get("image_data_uri")
+
+        USER_STATE.pop(user_id, None)
+
+        if not image_data_uri:
+            send_message(
+                chat_id,
+                "Rasm ma'lumoti topilmadi. "
+                "Qaytadan boshlang."
+            )
+            return
+
+        generate_video_and_send(
+            chat_id,
+            user_id,
+            text,
+            image_data_uri=image_data_uri
+        )
+        return
+
+    # FAYL KUTILAYOTGAN HOLATLAR
+    if state in (
+        "video_to_image_wait_video",
+        "image_video_wait_image"
+    ):
+        send_message(
+            chat_id,
+            "Kerakli faylni yuboring yoki /cancel bosing."
+        )
         return
 
     send_message(
@@ -1090,6 +1838,7 @@ def process_message(message):
 def process_update(update):
     if "message" in update:
         process_message(update["message"])
+
     elif "callback_query" in update:
         process_callback(update["callback_query"])
 
@@ -1099,7 +1848,9 @@ def process_update(update):
 # =========================
 
 def polling_loop():
-    log.info("Telegram polling boshlandi")
+    log.info(
+        "Telegram polling boshlandi"
+    )
 
     try:
         tg_call(
@@ -1107,8 +1858,11 @@ def polling_loop():
             {"drop_pending_updates": False},
             timeout=20
         )
+
     except Exception:
-        log.exception("Webhook tekshiruvi xatosi")
+        log.exception(
+            "Webhook tekshiruvi xatosi"
+        )
 
     offset = None
 
@@ -1136,6 +1890,7 @@ def polling_loop():
 
                 try:
                     process_update(update)
+
                 except Exception:
                     log.exception(
                         "Update qayta ishlanmadi: %s",
@@ -1143,7 +1898,10 @@ def polling_loop():
                     )
 
         except Exception:
-            log.exception("Telegram polling xatosi")
+            log.exception(
+                "Telegram polling xatosi"
+            )
+
             time.sleep(3)
 
 
@@ -1161,7 +1919,9 @@ def home():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok"
+    })
 
 
 # =========================
@@ -1174,9 +1934,13 @@ if BOT_TOKEN:
         daemon=True,
         name="telegram-polling"
     )
+
     thread.start()
+
 else:
-    log.error("BOT_TOKEN sozlanmagan")
+    log.error(
+        "BOT_TOKEN sozlanmagan"
+    )
 
 
 if __name__ == "__main__":
