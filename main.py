@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import base64
 import logging
@@ -34,7 +35,7 @@ CARD_OWNER = os.getenv("CARD_OWNER", "").strip()
 PACK_PRICES = os.getenv(
     "PACK_PRICES",
     "10:10000,30:25000,100:70000"
-)
+).strip()
 
 PROMPT_MODEL = "@cf/meta/llama-3.2-3b-instruct"
 
@@ -59,6 +60,7 @@ SB_API = (
 )
 
 USER_STATE = {}
+POLLING_LOCK = threading.Lock()
 
 
 # =========================
@@ -78,7 +80,7 @@ def load_packs():
                 result.append((credits, amount))
 
         except (ValueError, TypeError):
-            log.warning("Noto'g'ri paket: %s", item)
+            log.warning("Noto'g'ri kredit paketi: %s", item)
 
     return result or [
         (10, 10000),
@@ -215,10 +217,7 @@ def get_telegram_file_bytes(file_id, max_size=None):
         f"{BOT_TOKEN}/{file_info['file_path']}"
     )
 
-    response = requests.get(
-        file_url,
-        timeout=90
-    )
+    response = requests.get(file_url, timeout=90)
 
     if not response.ok:
         raise RuntimeError(
@@ -250,6 +249,7 @@ def sb_request(
         "Content-Type": "application/json"
     }
 
+    # Eski JWT formatidagi Supabase kalitlari uchun.
     if SB_KEY.startswith("eyJ"):
         headers["Authorization"] = f"Bearer {SB_KEY}"
 
@@ -457,7 +457,7 @@ def show_packs(chat_id):
 
 
 # =========================
-# CLOUDFLARE
+# CLOUDFLARE API
 # =========================
 
 def cloudflare_headers():
@@ -480,6 +480,65 @@ def cloudflare_endpoint(model):
 
 
 # =========================
+# DUTORNI ANIQLASH
+# =========================
+
+DUTOR_PATTERN = re.compile(
+    r"(?<![a-zA-Z])dutor(?:ning|ni|ga|dan|lar|im|i)?(?![a-zA-Z])",
+    re.IGNORECASE
+)
+
+DUTAR_ENGLISH = (
+    "traditional Uzbek dutar, a two-stringed, "
+    "long-necked plucked string musical instrument"
+)
+
+
+def contains_dutor(text):
+    text = text.lower()
+    return bool(
+        DUTOR_PATTERN.search(text)
+        or re.search(r"(?<![a-zA-Z])dutar(?![a-zA-Z])", text)
+    )
+
+
+def is_simple_dutor_request(text):
+    """
+    Faqat 'Dutor', 'Dutor rasmi', 'Dutor surati'
+    kabi sodda so'rovlarni tekshiradi.
+    Bunday holatda tarjimon model ishlatilmaydi.
+    """
+    words = re.findall(
+        r"[a-zA-Zа-яА-ЯўқғҳЎҚҒҲ']+",
+        text.lower()
+    )
+
+    allowed_words = {
+        "dutor",
+        "dutar",
+        "dutorning",
+        "dutorni",
+        "dutorim",
+        "rasm",
+        "rasmi",
+        "rasmini",
+        "surat",
+        "surati",
+        "suratini",
+        "tasvir",
+        "tasviri",
+        "chiz",
+        "chizing"
+    }
+
+    return (
+        bool(words)
+        and contains_dutor(text)
+        and all(word in allowed_words for word in words)
+    )
+
+
+# =========================
 # O'ZBEKCHA MATNNI ICHKI TARJIMA QILISH
 # =========================
 
@@ -487,19 +546,87 @@ def make_english_prompt(user_text, media_type):
     if not user_text or not user_text.strip():
         raise RuntimeError("Prompt matni bo'sh.")
 
+    original_text = user_text.strip()
+    has_dutor = contains_dutor(original_text)
+
+    # Eng muhim tuzatish:
+    # "Dutor rasmi" bevosita to'g'ri inglizcha promptga aylanadi.
+    # Bunda Llama modelining dutorni general deb tushunishiga
+    # imkon berilmaydi.
+    if has_dutor and is_simple_dutor_request(original_text):
+        if media_type == "video":
+            return (
+                "A traditional Uzbek dutar, a two-stringed, "
+                "long-necked plucked string musical instrument. "
+                "Show the complete dutar clearly. "
+                "The dutar is the main subject. "
+                "Do not show a person, soldier, military officer, "
+                "general, uniform, or unrelated object."
+            )
+
+        return (
+            "A clear, realistic image of one traditional Uzbek dutar, "
+            "a two-stringed, long-necked plucked string musical instrument. "
+            "Show the complete musical instrument clearly as the main "
+            "subject. The dutar is a musical instrument, not a person. "
+            "Do not show a human, soldier, military officer, general, "
+            "military uniform, or unrelated object."
+        )
+
     if media_type == "image":
         task = (
-            "Create a detailed English prompt for an AI image. "
-            "Describe the requested subject, scene, composition, "
-            "lighting, colors and atmosphere."
+            "Translate the user's request into a clear English image "
+            "generation prompt. Preserve the exact requested subject, "
+            "objects, actions, colors, location and composition. "
         )
     else:
         task = (
-            "Create a detailed English prompt for an AI video. "
-            "Describe the exact requested subject and actions, "
-            "movement, camera motion, lighting and atmosphere. "
-            "Make the action suitable for a five-second video."
+            "Translate the user's request into a clear English video "
+            "generation prompt. Preserve the exact requested subject, "
+            "objects, actions, movement and scene. "
+            "The video duration is five seconds. "
         )
+
+    # Agar foydalanuvchi dutor deb yozgan bo'lsa,
+    # tarjimonning o'zbekcha so'zni noto'g'ri tushunish ehtimolini kamaytiramiz.
+    if has_dutor:
+        safe_user_text = DUTOR_PATTERN.sub(
+            f"{DUTAR_ENGLISH} (called dutor in Uzbek)",
+            original_text
+        )
+
+        safe_user_text = re.sub(
+            r"(?<![a-zA-Z])dutar(?![a-zA-Z])",
+            DUTAR_ENGLISH,
+            safe_user_text,
+            flags=re.IGNORECASE
+        )
+
+        subject_rule = (
+            " IMPORTANT SUBJECT RULE: The word dutor means the "
+            "traditional Uzbek musical instrument called a dutar. "
+            "It is NOT a person, NOT a military general, NOT an officer, "
+            "and NOT a soldier. The requested main subject must remain "
+            "the dutar musical instrument. Do not replace it with a person "
+            "or another object. "
+        )
+    else:
+        safe_user_text = original_text
+        subject_rule = ""
+
+    system_prompt = (
+        "You translate Uzbek requests into English prompts for image "
+        "and video generation. "
+        "Do not invent a new subject. Do not replace the user's subject. "
+        "Do not add people, animals, buildings, vehicles, uniforms, "
+        "weapons, scenery, actions, or objects unless the user requested "
+        "them. Keep the user's meaning and details. "
+        "Do not add cinematic effects or extra decorations unless asked. "
+        + subject_rule
+        + task
+        + "Return only the final English prompt. "
+        "Do not include explanations, labels or quotation marks."
+    )
 
     response = requests.post(
         cloudflare_endpoint(PROMPT_MODEL),
@@ -508,26 +635,16 @@ def make_english_prompt(user_text, media_type):
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a professional AI prompt writer. "
-                        "Understand the user's Uzbek text and convert "
-                        "it into a clear, natural English prompt. "
-                        "Preserve the exact meaning and requested subject. "
-                        "Do not replace the subject. Do not invent a "
-                        "different scene. Do not add unrelated objects "
-                        "or actions. "
-                        + task
-                        + " Return only the final English prompt. "
-                        "Do not include explanations."
-                    )
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
-                    "content": user_text
+                    "content": safe_user_text
                 }
             ],
             "max_tokens": 400,
-            "temperature": 0.2
+            "temperature": 0.1,
+            "top_p": 0.2
         },
         timeout=120
     )
@@ -555,7 +672,35 @@ def make_english_prompt(user_text, media_type):
     if not english_prompt or not str(english_prompt).strip():
         raise RuntimeError("AI inglizcha prompt qaytarmadi.")
 
-    return str(english_prompt).strip().strip('"').strip("'")
+    english_prompt = (
+        str(english_prompt)
+        .strip()
+        .strip('"')
+        .strip("'")
+    )
+
+    # Dutor so'ralgan bo'lsa-yu, tarjimada dutar so'zi yo'qolsa,
+    # noto'g'ri rasm yaratmaslik uchun xatoga to'xtatamiz.
+    if has_dutor:
+        if not re.search(
+            r"\bdutar\b|\btraditional Uzbek dutar\b",
+            english_prompt,
+            re.IGNORECASE
+        ):
+            raise RuntimeError(
+                "Tarjima dutor ma'nosini saqlamadi. "
+                "Noto'g'ri rasm yaratilmadi."
+            )
+
+        english_prompt = (
+            f"MAIN SUBJECT: {DUTAR_ENGLISH}. "
+            "It is a musical instrument, not a human. "
+            "Do not replace it with a person, general, officer, "
+            "soldier or military uniform. "
+            + english_prompt
+        )
+
+    return english_prompt
 
 
 # =========================
@@ -597,7 +742,8 @@ def create_image(prompt):
 
     if data.get("success") is False:
         raise RuntimeError(
-            f"Cloudflare rasm xatosi: {str(data.get('errors'))[:400]}"
+            f"Cloudflare rasm xatosi: "
+            f"{str(data.get('errors'))[:400]}"
         )
 
     result = data.get("result", data)
@@ -618,7 +764,9 @@ def create_image(prompt):
     try:
         return base64.b64decode(image)
     except Exception as exc:
-        raise RuntimeError(f"Rasm ma'lumoti ochilmadi: {exc}")
+        raise RuntimeError(
+            f"Rasm ma'lumoti ochilmadi: {exc}"
+        )
 
 
 def generate_and_send(chat_id, user_id, user_text):
@@ -640,9 +788,10 @@ def generate_and_send(chat_id, user_id, user_text):
 
         charged = True
 
-        # Faqat rasm yaratilayotgani ko'rsatiladi.
-        # Inglizcha prompt foydalanuvchiga yuborilmaydi.
-        send_message(chat_id, "🖼️ Rasm yaratilmoqda. Kuting...")
+        send_message(
+            chat_id,
+            "🖼️ Rasm yaratilmoqda. Kuting..."
+        )
 
         english_prompt = make_english_prompt(
             user_text,
@@ -663,7 +812,7 @@ def generate_and_send(chat_id, user_id, user_text):
             remaining
         )
 
-    except Exception:
+    except Exception as error:
         log.exception("Rasm yaratish xatosi")
 
         if charged:
@@ -697,7 +846,11 @@ def create_video(prompt, image_data_uri=None):
         "fps": VIDEO_FPS,
         "draft": VIDEO_DRAFT,
         "save_audio": True,
-        "prompt_upsampling": True,
+
+        # O'CHIRILDI:
+        # Model promptni o'zicha kengaytirmaydi.
+        "prompt_upsampling": False,
+
         "disable_safety_filter": False
     }
 
@@ -798,7 +951,6 @@ def generate_video_and_send(
 
         charged = True
 
-        # Tarjima haqida hech qanday xabar chiqarilmaydi.
         send_message(
             chat_id,
             "🎬 5 soniyalik HD video yaratilmoqda. Kuting..."
@@ -1274,7 +1426,9 @@ def process_callback(callback):
                 price_map[credits]
             )
 
-            price_text = f"{price_map[credits]:,}".replace(",", " ")
+            price_text = (
+                f"{price_map[credits]:,}".replace(",", " ")
+            )
 
             send_message(
                 chat_id,
@@ -1332,7 +1486,7 @@ def process_message(message):
         return
 
     user_id = int(user_id)
-    text = message.get("text", "")
+    text = message.get("text", "").strip()
     state = USER_STATE.get(user_id)
 
     # START
@@ -1381,6 +1535,7 @@ def process_message(message):
             "🖼️ Qanday rasm xohlayotganingizni yozing.\n\n"
             "Masalan: Quyosh botayotgan paytda "
             "dengiz bo'yida turgan oq ot.\n\n"
+            "O'zbekcha yozishingiz mumkin.\n"
             "/cancel — bekor qilish."
         )
         return
@@ -1396,6 +1551,7 @@ def process_message(message):
             "kamera uni orqasidan kuzatsin.\n\n"
             "Davomiyligi: 5 soniya.\n"
             "Sifati: HD 720p.\n\n"
+            "O'zbekcha yozishingiz mumkin.\n"
             "/cancel — bekor qilish."
         )
         return
@@ -1461,6 +1617,7 @@ def process_message(message):
             "💳 Kredit sotib olish — paketni tanlang.\n"
             "💰 Balans — qolgan kreditlarni ko'ring.\n\n"
             "Har bir AI yaratish amali 1 kredit sarflaydi.\n"
+            "O'zbekcha matn yozishingiz mumkin.\n"
             "/cancel — joriy amalni bekor qilish.\n\n"
             "To'lovlar admin tomonidan tekshiriladi."
         )
@@ -1573,6 +1730,7 @@ def process_message(message):
 def process_update(update):
     if "message" in update:
         process_message(update["message"])
+
     elif "callback_query" in update:
         process_callback(update["callback_query"])
 
@@ -1582,6 +1740,11 @@ def process_update(update):
 # =========================
 
 def polling_loop():
+    # Bitta polling thread ishlashini nazorat qilish.
+    if not POLLING_LOCK.acquire(blocking=False):
+        log.warning("Polling allaqachon ishlayapti.")
+        return
+
     log.info("Telegram polling boshlandi")
 
     try:
@@ -1644,7 +1807,14 @@ def home():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "telegram_configured": bool(BOT_TOKEN),
+        "cloudflare_configured": bool(
+            CF_ACCOUNT_ID and CF_API_TOKEN
+        ),
+        "supabase_configured": bool(SB_URL and SB_KEY)
+    })
 
 
 # =========================
