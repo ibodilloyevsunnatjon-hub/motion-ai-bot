@@ -38,6 +38,7 @@ PACK_PRICES = os.getenv(
 ).strip()
 
 PROMPT_MODEL = "@cf/meta/llama-3.2-3b-instruct"
+TRANSLATE_MODEL = "@cf/meta/m2m100-1.2b"
 
 VIDEO_MODEL = "pruna/p-video"
 VIDEO_DURATION = 5
@@ -538,40 +539,141 @@ def is_simple_dutor_request(text):
     )
 
 
+def simple_dutor_prompt(media_type):
+    if media_type == "video":
+        return (
+            "A traditional Uzbek dutar, a two-stringed, "
+            "long-necked plucked string musical instrument. "
+            "Show the complete dutar clearly. "
+            "The dutar is the main subject. "
+            "Do not show a person, soldier, military officer, "
+            "general, uniform, or unrelated object."
+        )
+
+    return (
+        "A clear, realistic image of one traditional Uzbek dutar, "
+        "a two-stringed, long-necked plucked string musical instrument. "
+        "Show the complete musical instrument clearly as the main "
+        "subject. The dutar is a musical instrument, not a person. "
+        "Do not show a human, soldier, military officer, general, "
+        "military uniform, or unrelated object."
+    )
+
+
 # =========================
-# O'ZBEKCHA MATNNI ICHKI TARJIMA QILISH
+# O'ZBEKCHA MATNNI INGLIZCHAGA TARJIMA QILISH
 # =========================
 
-def make_english_prompt(user_text, media_type):
-    if not user_text or not user_text.strip():
-        raise RuntimeError("Prompt matni bo'sh.")
+CYR_TO_LAT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+    "ё": "yo", "ж": "j", "з": "z", "и": "i", "й": "y", "к": "k",
+    "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "x", "ц": "ts",
+    "ч": "ch", "ш": "sh", "ъ": "'", "ы": "i", "ь": "", "э": "e",
+    "ю": "yu", "я": "ya", "ў": "o'", "қ": "q", "ғ": "g'", "ҳ": "h"
+}
 
+ENGLISH_WORDS = {
+    "the", "a", "an", "of", "with", "and", "in", "on", "at",
+    "is", "are", "to", "for", "from", "by"
+}
+
+
+def cyrillic_to_latin(text):
+    result = []
+
+    for ch in text:
+        low = ch.lower()
+
+        if low in CYR_TO_LAT:
+            lat = CYR_TO_LAT[low]
+            result.append(lat.capitalize() if ch.isupper() else lat)
+        else:
+            result.append(ch)
+
+    return "".join(result)
+
+
+def normalize_apostrophes(text):
+    for ch in ("‘", "’", "ʻ", "ʼ", "`", "´"):
+        text = text.replace(ch, "'")
+
+    return text
+
+
+def looks_english(text):
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+
+    if len(words) < 2:
+        return False
+
+    hits = sum(1 for word in words if word in ENGLISH_WORDS)
+    return hits >= 2 or hits / len(words) >= 0.25
+
+
+def detect_source_lang(text):
+    if re.search(r"[ўқғҳЎҚҒҲ]", text):
+        return "uz", cyrillic_to_latin(text)
+
+    if re.search(r"[а-яА-ЯёЁ]", text):
+        return "ru", text
+
+    return "uz", text
+
+
+def translate_m2m(text, source_lang):
+    response = requests.post(
+        cloudflare_endpoint(TRANSLATE_MODEL),
+        headers=cloudflare_headers(),
+        json={
+            "text": text,
+            "source_lang": source_lang,
+            "target_lang": "en"
+        },
+        timeout=60
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Tarjima HTTP {response.status_code}: "
+            f"{response.text[:400]}"
+        )
+
+    data = response.json()
+
+    if data.get("success") is False:
+        raise RuntimeError(
+            f"Tarjima xatosi: {str(data.get('errors'))[:400]}"
+        )
+
+    result = data.get("result", data)
+    translated = (
+        result.get("translated_text")
+        if isinstance(result, dict)
+        else None
+    )
+
+    if not translated or not str(translated).strip():
+        raise RuntimeError("Tarjima bo'sh qaytdi")
+
+    translated = str(translated).strip()
+
+    if translated.startswith("ERROR"):
+        raise RuntimeError(f"Tarjima xatosi: {translated[:300]}")
+
+    return translated
+
+
+def make_english_prompt_llm(user_text, media_type):
+    """
+    Zaxira usul: Llama modeli orqali tarjima.
+    Faqat M2M100 ishlamaganda ishga tushadi.
+    """
     original_text = user_text.strip()
     has_dutor = contains_dutor(original_text)
 
-    # Eng muhim tuzatish:
-    # "Dutor rasmi" bevosita to'g'ri inglizcha promptga aylanadi.
-    # Bunda Llama modelining dutorni general deb tushunishiga
-    # imkon berilmaydi.
     if has_dutor and is_simple_dutor_request(original_text):
-        if media_type == "video":
-            return (
-                "A traditional Uzbek dutar, a two-stringed, "
-                "long-necked plucked string musical instrument. "
-                "Show the complete dutar clearly. "
-                "The dutar is the main subject. "
-                "Do not show a person, soldier, military officer, "
-                "general, uniform, or unrelated object."
-            )
-
-        return (
-            "A clear, realistic image of one traditional Uzbek dutar, "
-            "a two-stringed, long-necked plucked string musical instrument. "
-            "Show the complete musical instrument clearly as the main "
-            "subject. The dutar is a musical instrument, not a person. "
-            "Do not show a human, soldier, military officer, general, "
-            "military uniform, or unrelated object."
-        )
+        return simple_dutor_prompt(media_type)
 
     if media_type == "image":
         task = (
@@ -587,8 +689,6 @@ def make_english_prompt(user_text, media_type):
             "The video duration is five seconds. "
         )
 
-    # Agar foydalanuvchi dutor deb yozgan bo'lsa,
-    # tarjimonning o'zbekcha so'zni noto'g'ri tushunish ehtimolini kamaytiramiz.
     if has_dutor:
         safe_user_text = DUTOR_PATTERN.sub(
             f"{DUTAR_ENGLISH} (called dutor in Uzbek)",
@@ -679,19 +779,7 @@ def make_english_prompt(user_text, media_type):
         .strip("'")
     )
 
-    # Dutor so'ralgan bo'lsa-yu, tarjimada dutar so'zi yo'qolsa,
-    # noto'g'ri rasm yaratmaslik uchun xatoga to'xtatamiz.
     if has_dutor:
-        if not re.search(
-            r"\bdutar\b|\btraditional Uzbek dutar\b",
-            english_prompt,
-            re.IGNORECASE
-        ):
-            raise RuntimeError(
-                "Tarjima dutor ma'nosini saqlamadi. "
-                "Noto'g'ri rasm yaratilmadi."
-            )
-
         english_prompt = (
             f"MAIN SUBJECT: {DUTAR_ENGLISH}. "
             "It is a musical instrument, not a human. "
@@ -699,6 +787,55 @@ def make_english_prompt(user_text, media_type):
             "soldier or military uniform. "
             + english_prompt
         )
+
+    return english_prompt
+
+
+def make_english_prompt(user_text, media_type):
+    if not user_text or not user_text.strip():
+        raise RuntimeError("Prompt matni bo'sh.")
+
+    original_text = normalize_apostrophes(user_text.strip())
+    has_dutor = contains_dutor(original_text)
+
+    # Sodda "dutor rasmi" so'rovi uchun tayyor prompt bor.
+    if has_dutor and is_simple_dutor_request(original_text):
+        return simple_dutor_prompt(media_type)
+
+    if looks_english(original_text):
+        english_prompt = original_text
+    else:
+        source_lang, source_text = detect_source_lang(original_text)
+
+        if has_dutor:
+            source_text = DUTOR_PATTERN.sub(
+                "dutor (musiqa asbobi)",
+                source_text
+            )
+
+        try:
+            english_prompt = translate_m2m(source_text, source_lang)
+        except Exception:
+            log.exception(
+                "M2M tarjima ishlamadi, zaxira usul ishlatiladi"
+            )
+            return make_english_prompt_llm(original_text, media_type)
+
+    english_prompt = english_prompt.strip().strip('"').strip("'")
+
+    if has_dutor:
+        english_prompt = (
+            f"MAIN SUBJECT: {DUTAR_ENGLISH}. "
+            "It is a musical instrument, not a human. "
+            + english_prompt
+        )
+
+    log.info(
+        "Prompt tarjimasi (%s): %r -> %r",
+        media_type,
+        original_text[:100],
+        english_prompt[:250]
+    )
 
     return english_prompt
 
@@ -847,7 +984,6 @@ def create_video(prompt, image_data_uri=None):
         "draft": VIDEO_DRAFT,
         "save_audio": True,
 
-        # O'CHIRILDI:
         # Model promptni o'zicha kengaytirmaydi.
         "prompt_upsampling": False,
 
@@ -1799,6 +1935,16 @@ def polling_loop():
 
 @app.get("/")
 def home():
+    # Supabase loyihasi 7 kun so'rovsiz qolib to'xtab qolmasligi uchun.
+    try:
+        sb_request(
+            "GET",
+            "users",
+            params={"select": "user_id", "limit": "1"}
+        )
+    except Exception:
+        log.warning("Supabase keepalive so'rovi bajarilmadi")
+
     return jsonify({
         "service": "Motion AI",
         "status": "running"
