@@ -561,6 +561,121 @@ def simple_dutor_prompt(media_type):
 
 
 # =========================
+# MASHHUR SO'ZLAR LUG'ATI
+# =========================
+# Bitta-ikkita so'zdan iborat so'rovlarda tarjima modeli
+# adashmasligi uchun. Yangi so'z qo'shish uchun shu ro'yxatga
+# "o'zbekcha": "english" ko'rinishida qator qo'shing.
+
+UZ_NOUNS = {
+    # hayvonlar
+    "mushuk": "cat", "it": "dog", "kuchuk": "puppy", "ot": "horse",
+    "sigir": "cow", "buzoq": "calf", "qo'y": "sheep", "echki": "goat",
+    "tovuq": "chicken", "xo'roz": "rooster", "o'rdak": "duck",
+    "g'oz": "goose", "quyon": "rabbit", "bo'ri": "wolf",
+    "tulki": "fox", "ayiq": "bear", "sher": "lion",
+    "yo'lbars": "tiger", "fil": "elephant", "maymun": "monkey",
+    "tuya": "camel", "eshak": "donkey", "baliq": "fish",
+    "qush": "bird", "burgut": "eagle", "kaptar": "pigeon",
+    "ilon": "snake", "toshbaqa": "turtle", "kapalak": "butterfly",
+    "ari": "bee", "chumoli": "ant", "o'rgimchak": "spider",
+    "kiyik": "deer", "jirafa": "giraffe", "delfin": "dolphin",
+    # meva va ovqat
+    "olma": "apple", "nok": "pear", "anor": "pomegranate",
+    "uzum": "grapes", "o'rik": "apricot", "shaftoli": "peach",
+    "gilos": "cherry", "qovun": "melon", "tarvuz": "watermelon",
+    "banan": "banana", "limon": "lemon", "non": "bread",
+    "choy": "tea", "palov": "plov", "somsa": "samsa",
+    # tabiat
+    "daraxt": "tree", "gul": "flower", "tog'": "mountain",
+    "daryo": "river", "ko'l": "lake", "dengiz": "sea",
+    "okean": "ocean", "quyosh": "sun", "oy": "moon",
+    "yulduz": "star", "bulut": "cloud", "yomg'ir": "rain",
+    "qor": "snow", "o'rmon": "forest", "cho'l": "desert",
+    "sharshara": "waterfall", "bog'": "garden", "dala": "field",
+    "paxta": "cotton", "bug'doy": "wheat",
+    # narsa va joylar
+    "uy": "house", "mashina": "car", "velosiped": "bicycle",
+    "samolyot": "airplane", "kema": "ship", "poyezd": "train",
+    "traktor": "tractor", "kitob": "book", "qalam": "pencil",
+    "stol": "table", "stul": "chair",
+    "do'ppi": "doppi, a traditional Uzbek skullcap",
+    "choyxona": "traditional Uzbek teahouse", "bozor": "bazaar",
+    "masjid": "mosque", "minora": "minaret", "ko'prik": "bridge",
+    "shahar": "city", "qishloq": "village",
+    # odamlar
+    "bola": "child", "qiz": "girl", "yigit": "young man",
+    "ayol": "woman", "erkak": "man"
+}
+
+UZ_ADJECTIVES = {
+    "katta": "big", "kichik": "small", "qora": "black", "oq": "white",
+    "qizil": "red", "yashil": "green", "sariq": "yellow",
+    "ko'k": "blue", "jigarrang": "brown", "pushti": "pink",
+    "chiroyli": "beautiful", "yosh": "young", "keksa": "old",
+    "baland": "tall", "uzun": "long"
+}
+
+UZ_SUFFIXES = ("ning", "dan", "ga", "ni", "da", "si", "im", "ing", "i")
+
+
+def lookup_uz_word(word):
+    """(english, is_noun) yoki None qaytaradi."""
+    candidates = [word]
+
+    for suffix in UZ_SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 2:
+            candidates.append(word[:-len(suffix)])
+
+    for candidate in candidates:
+        if candidate in UZ_NOUNS:
+            return UZ_NOUNS[candidate], True
+
+        if candidate in UZ_ADJECTIVES:
+            return UZ_ADJECTIVES[candidate], False
+
+    return None
+
+
+def dictionary_prompt(text, media_type):
+    """
+    Matn faqat lug'atdagi so'zlardan iborat bo'lsa,
+    tarjima modelisiz to'g'ri inglizcha prompt qaytaradi.
+    Aks holda None.
+    """
+    words = re.findall(r"[a-z']+", text.lower())
+
+    if not words or len(words) > 4:
+        return None
+
+    english = []
+    has_noun = False
+
+    for word in words:
+        found = lookup_uz_word(word)
+
+        if not found:
+            return None
+
+        english.append(found[0])
+        has_noun = has_noun or found[1]
+
+    if not has_noun:
+        return None
+
+    phrase = " ".join(english)
+    article = "an" if phrase[0] in "aeiou" else "a"
+
+    if media_type == "video":
+        return (
+            f"A realistic video of {article} {phrase}, "
+            "natural smooth movement."
+        )
+
+    return f"A realistic, high-quality photo of {article} {phrase}."
+
+
+# =========================
 # O'ZBEKCHA MATNNI INGLIZCHAGA TARJIMA QILISH
 # =========================
 
@@ -798,15 +913,30 @@ def make_english_prompt(user_text, media_type):
     original_text = normalize_apostrophes(user_text.strip())
     has_dutor = contains_dutor(original_text)
 
-    # Sodda "dutor rasmi" so'rovi uchun tayyor prompt bor.
+    # 1) Sodda "dutor rasmi" so'rovi uchun tayyor prompt bor.
     if has_dutor and is_simple_dutor_request(original_text):
         return simple_dutor_prompt(media_type)
 
+    source_lang, source_text = detect_source_lang(original_text)
+
+    # 2) Mashhur so'zlar lug'ati (tarjima modelisiz).
+    if not has_dutor and source_lang == "uz":
+        ready = dictionary_prompt(source_text, media_type)
+
+        if ready:
+            log.info(
+                "Lug'at orqali prompt (%s): %r -> %r",
+                media_type,
+                original_text[:100],
+                ready
+            )
+            return ready
+
+    # 3) Matn allaqachon inglizcha bo'lsa.
     if looks_english(original_text):
         english_prompt = original_text
     else:
-        source_lang, source_text = detect_source_lang(original_text)
-
+        # 4) M2M100 tarjima modeli.
         if has_dutor:
             source_text = DUTOR_PATTERN.sub(
                 "dutor (musiqa asbobi)",
@@ -940,7 +1070,8 @@ def generate_and_send(chat_id, user_id, user_text):
         send_image_bytes(
             chat_id,
             image_bytes,
-            "✅ Motion AI orqali yaratildi."
+            "✅ Motion AI orqali yaratildi.\n"
+            f"🔤 Prompt: {english_prompt[:300]}"
         )
 
         log.info(
@@ -1107,7 +1238,8 @@ def generate_video_and_send(
             video_bytes,
             "✅ Motion AI video yaratdi!\n"
             "Sifat: HD 720p\n"
-            "Davomiyligi: 5 soniya"
+            "Davomiyligi: 5 soniya\n"
+            f"🔤 Prompt: {english_prompt[:300]}"
         )
 
         log.info(
